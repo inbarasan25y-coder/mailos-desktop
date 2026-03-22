@@ -1,0 +1,23 @@
+{
+  "name": "mailos-backend",
+  "version": "1.0.0",
+  "description": "MailOS Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "generate-key": "node -e \"require('fs').writeFileSync('.env', 'MASTER_KEY=' + require('crypto').randomBytes(32).toString('hex') + '\\nPORT=5001\\nDB_PATH=./mailOS.db\\n')\""
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "imap": "^0.8.19",
+    "mailparser": "^3.7.1",
+    "nodemailer": "^6.9.13"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  }
+}

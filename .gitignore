@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build/
+.env
+mailOS.db
+mailOS.db-shm
+mailOS.db-wal
+*.db
+*.db-shm
+*.db-wal
+key.enc

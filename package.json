@@ -1,0 +1,81 @@
+{
+  "name": "mailos-desktop",
+  "version": "1.0.0",
+  "author": "MailOS",
+  "description": "MailOS — Desktop Email Campaign Manager",
+  "homepage": "./",
+  "private": true,
+  "main": "build/electron.js",
+  "scripts": {
+    "react:start": "react-scripts start",
+    "react:build": "react-scripts build && copy electron\\electron.js build\\electron.js && copy electron\\preload.js build\\preload.js",
+    "electron:dev": "concurrently \"npm run react:start\" \"wait-on http://localhost:3000 && cross-env NODE_ENV=development electron .\"",
+    "electron:build:win": "npm run react:build && electron-builder build --win",
+    "electron:build:mac": "npm run react:build && electron-builder build --mac",
+    "electron:build:linux": "npm run react:build && electron-builder build --linux",
+    "start": "npm run electron:dev",
+    "build": "npm run electron:build:win"
+  },
+  "dependencies": {
+    "better-sqlite3": "^9.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "electron-updater": "^6.1.7",
+    "express": "^4.19.2",
+    "imap": "^0.8.19",
+    "mailparser": "^3.7.1",
+    "nodemailer": "^6.9.13",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-scripts": "5.0.1"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.mailos.desktop",
+    "productName": "MailOS",
+    "copyright": "MailOS Desktop",
+    "files": [
+      "build/**/*",
+      "server.js",
+      ".env",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/**/*",
+      "server.js"
+    ],
+    "win": {
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "publisherName": "MailOS",
+      "requestedExecutionLevel": "requireAdministrator"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "MailOS"
+    },
+    "mac": {
+      "target": [{ "target": "dmg", "arch": ["x64", "arm64"] }],
+      "category": "public.app-category.productivity"
+    },
+    "linux": {
+      "target": [{ "target": "AppImage", "arch": ["x64"] }],
+      "category": "Office"
+    }
+  },
+  "eslintConfig": { "extends": ["react-app"] },
+  "browserslist": {
+    "production": [">0.2%", "not dead", "not op_mini all"],
+    "development": ["last 1 chrome version"]
+  }
+}

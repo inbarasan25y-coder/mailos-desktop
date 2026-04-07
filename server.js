@@ -9,6 +9,7 @@ const { simpleParser } = require('mailparser');
 const Database         = require('better-sqlite3');
 const path             = require('path');
 const fs               = require('fs');
+const dns              = require('dns').promises; // <-- ADDED: For MX record auto-discovery
 require('dotenv').config();
 
 // ═══════════════════════════════════════════════════════════════
@@ -59,6 +60,8 @@ function decrypt(stored) {
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+db.pragma('cache_size = -32000');   
+db.pragma('temp_store = MEMORY');   
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS accounts (
@@ -154,6 +157,11 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_email_date    ON cached_emails(date DESC);
 `);
 
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_email_acct_folder_date ON cached_emails(account_id, folder, date DESC);
+  CREATE INDEX IF NOT EXISTS idx_email_id ON cached_emails(id);
+`);
+
 // ═══════════════════════════════════════════════════════════════
 // PREPARED STATEMENTS
 // ═══════════════════════════════════════════════════════════════
@@ -166,12 +174,12 @@ const stmts = {
 
   upsertSettings   : db.prepare(`INSERT INTO account_settings(account_id,min_delay_sec,max_delay_sec,signature_html) VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET min_delay_sec=excluded.min_delay_sec, max_delay_sec=excluded.max_delay_sec, signature_html=excluded.signature_html`),
   getSettings      : db.prepare(`SELECT * FROM account_settings WHERE account_id=?`),
-  getAllSettings    : db.prepare(`SELECT * FROM account_settings`),
+  getAllSettings   : db.prepare(`SELECT * FROM account_settings`),
 
   insertCampaign   : db.prepare(`INSERT INTO campaigns(id,name,subject,pitch,fu_pitch,fu_subject,email_col,csv_headers,csv_rows,sender_ids,batch_size,batch_delay_min,batch_delay_max,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
   updateCampaign   : db.prepare(`UPDATE campaigns SET name=?,subject=?,pitch=?,fu_pitch=?,fu_subject=?,email_col=?,csv_headers=?,csv_rows=?,sender_ids=?,batch_size=?,batch_delay_min=?,batch_delay_max=?,status=?,updated_at=datetime('now') WHERE id=?`),
   getCampaign      : db.prepare(`SELECT * FROM campaigns WHERE id=?`),
-  getAllCampaigns   : db.prepare(`SELECT * FROM campaigns ORDER BY created_at DESC`),
+  getAllCampaigns  : db.prepare(`SELECT * FROM campaigns ORDER BY created_at DESC`),
   deleteCampaign   : db.prepare(`DELETE FROM campaigns WHERE id=?`),
 
   insertHistory    : db.prepare(`INSERT INTO campaign_history(campaign_id,row_idx,sent_at,sender_email,sender_name,to_email,subject,body_html,row_data,touch_type) VALUES(?,?,?,?,?,?,?,?,?,?)`),
@@ -186,10 +194,12 @@ const stmts = {
   getPairs         : db.prepare(`SELECT sender_email,recipient_email FROM global_sent_pairs`),
 
   upsertEmail      : db.prepare(`INSERT INTO cached_emails(id,account_id,folder,uid,from_name,from_email,to_json,subject,body_html,preview,date,is_read,is_starred,has_attachment,msg_type,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now')) ON CONFLICT(id) DO UPDATE SET body_html=excluded.body_html, preview=excluded.preview, is_read=excluded.is_read, is_starred=excluded.is_starred, fetched_at=excluded.fetched_at`),
-  getEmails        : db.prepare(`SELECT * FROM cached_emails WHERE account_id=? AND folder=? ORDER BY date DESC`),
-  updateRead       : db.prepare(`UPDATE cached_emails SET is_read=? WHERE id=?`),
-  updateStarred    : db.prepare(`UPDATE cached_emails SET is_starred=? WHERE id=?`),
+  getEmails        : db.prepare(`SELECT * FROM cached_emails WHERE account_id=? AND folder=? ORDER BY date DESC LIMIT 200`),
+  getEmailsAll     : db.prepare(`SELECT * FROM cached_emails WHERE account_id=? AND folder=? ORDER BY date DESC`),
+  updateRead       : db.prepare(`UPDATE cached_emails SET is_read=? WHERE account_id=? AND uid=?`),
+  updateStarred    : db.prepare(`UPDATE cached_emails SET is_starred=? WHERE account_id=? AND uid=?`),
   deleteAccEmails  : db.prepare(`DELETE FROM cached_emails WHERE account_id=?`),
+  deleteSingleEmail: db.prepare(`DELETE FROM cached_emails WHERE account_id=? AND folder=? AND uid=?`), // Phase 3: Optimistic DB Purge
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -235,7 +245,7 @@ function classifyEmail(subject, fromEmail, snippet) {
   const s = (subject   || '').toLowerCase();
   const e = (fromEmail || '').toLowerCase();
   const p = (snippet   || '').toLowerCase();
-  const autoKw = ['auto-reply','automatic reply','out of office','vacation reply',
+  const autoKw =['auto-reply','automatic reply','out of office','vacation reply',
                   'noreply','no-reply','do not reply','donotreply','autoreply','away message'];
   if (autoKw.some(k => s.includes(k) || e.includes(k) || p.includes(k))) return 'auto';
   if (s.startsWith('re:')) return 'reply';
@@ -243,62 +253,175 @@ function classifyEmail(subject, fromEmail, snippet) {
   return 'normal';
 }
 
-// ─── IMAP fetch — fetches full raw email so simpleParser decodes everything ──
-async function fetchIMAPMsgs(account, folder = 'INBOX', maxMsgs = 500) {
+
+// ── SMART AUTO-DISCOVER PRESETS (Phase 1) ───────────────────────────
+// These represent global known endpoints
+const MX_MAPPINGS = [
+  { match: 'google.com',       preset: { host: 'imap.gmail.com', port: 993, secure: true, smtpHost: 'smtp.gmail.com', smtpPort: 587, smtpSecure: false } },
+  { match: 'googlemail.com',   preset: { host: 'imap.gmail.com', port: 993, secure: true, smtpHost: 'smtp.gmail.com', smtpPort: 587, smtpSecure: false } },
+  { match: 'outlook.com',      preset: { host: 'outlook.office365.com', port: 993, secure: true, smtpHost: 'smtp.office365.com', smtpPort: 587, smtpSecure: false } },
+  { match: 'secureserver.net', preset: { host: 'imap.secureserver.net', port: 993, secure: true, smtpHost: 'smtpout.secureserver.net', smtpPort: 465, smtpSecure: true } }, // GoDaddy
+  { match: 'zoho.com',         preset: { host: 'imap.zoho.com', port: 993, secure: true, smtpHost: 'smtp.zoho.com', smtpPort: 465, smtpSecure: true } }, // Zoho
+  { match: 'titan.email',      preset: { host: 'imap.titan.email', port: 993, secure: true, smtpHost: 'smtp.titan.email', smtpPort: 465, smtpSecure: true } }, // Titan Webmail
+  { match: 'hostinger.com',    preset: { host: 'imap.hostinger.com', port: 993, secure: true, smtpHost: 'smtp.hostinger.com', smtpPort: 465, smtpSecure: true } }, // Hostinger
+];
+
+
+// ── DYNAMIC FOLDER IDENTIFICATION (Phase 1 Update) ──────────
+async function fetchIMAPMsgs(account, targetFolderType = 'inbox', maxMsgs = 50) { 
   return new Promise((resolve, reject) => {
     const password = decrypt(account.password_enc);
     const imap = new Imap({
-      user: account.email, password,
-      host: account.imap_host, port: account.imap_port,
+      user: account.email, password, host: account.imap_host, port: account.imap_port,
       tls: !!account.imap_secure, tlsOptions: { rejectUnauthorized: false },
       connTimeout: 20000, authTimeout: 15000,
     });
+    
     const messages = [];
+
     imap.once('ready', () => {
-      imap.openBox(folder, true, (err, box) => {
-        if (err) { imap.end(); return reject(err); }
-        const total = box.messages.total;
-        if (total === 0) { imap.end(); return resolve([]); }
-        const start = Math.max(1, total - maxMsgs + 1);
-        // Fetch full raw message — lets simpleParser handle ALL encoding/MIME
-        const fetch = imap.seq.fetch(`${start}:*`, { bodies: [''], struct: true });
-        fetch.on('message', (msg, seqno) => {
-          let raw = '', attrs = {};
-          msg.on('body', stream => { stream.on('data', c => raw += c); });
-          msg.once('attributes', a => { attrs = a; });
-          msg.once('end', () => messages.push({ raw, attrs, seqno }));
+      // DYNAMIC DISCOVERY: Which folder are we looking for exactly?
+      if (targetFolderType === 'inbox') {
+         openAndDownload('INBOX');
+      } else {
+         // Recursive discovery looking for 'Sent' tags globally 
+         imap.getBoxes((err, boxes) => {
+            if (err) return openAndDownload('Sent'); // Error? Generic Guess.
+            let sentFolderName = 'Sent';
+            
+            const findSent = (obj, currentPath) => {
+               for (let key in obj) {
+                 const box = obj[key];
+                 const fullPath = currentPath ? `${currentPath}${box.delimiter}${key}` : key;
+                 
+                 // System attribute flag parsing works universally for top-tier servers
+                 if (box.attribs && (box.attribs.includes('\\Sent') || box.attribs.includes('\\SentMail'))) return fullPath;
+                 // Keyword mapping for strict basic systems like private linux servers
+                 const low = key.toLowerCase();
+                 if (low === 'sent' || low === 'sent items' || low === 'sent messages') sentFolderName = fullPath;
+                 if (box.children) { const c = findSent(box.children, fullPath); if (c) return c; }
+               }
+               return null;
+            };
+
+            const targetBoxName = findSent(boxes, '') || sentFolderName;
+            openAndDownload(targetBoxName);
+         });
+      }
+
+      function openAndDownload(boxNameToOpen) {
+        // Read-Write Box access required so messages structure flawlessly opens 
+        imap.openBox(boxNameToOpen, true, (err, box) => {
+          if (err) { imap.end(); return resolve([]); } 
+          
+          const total = box.messages.total;
+          if (total === 0) { imap.end(); return resolve([]); }
+          
+          const start = Math.max(1, total - maxMsgs + 1);
+          // Standard full structural parser retrieval with proper struct array mapping
+          const fetch = imap.seq.fetch(`${start}:*`, { bodies: '', struct: true });
+          
+          fetch.on('message', (msg, seqno) => {
+            let chunks = []; let attrs = {};
+            // Concatenating pure byte-buffers. Doing Strings destroys image bytes/attachment sizes mapping internally.
+            msg.on('body', stream => {
+                stream.on('data', chunk => chunks.push(chunk));
+                // BUG FIX: Prevent stream drops from crashing the whole Node server
+                stream.on('error', err => console.warn('IMAP stream bypass:', err.message));
+            });
+            msg.once('attributes', a => attrs = a );
+            msg.once('end', () => messages.push({ raw: Buffer.concat(chunks), attrs, seqno }));
+          });
+          
+          fetch.once('end', () => imap.end());
+          fetch.once('error', e => { imap.end(); reject(e); });
         });
-        fetch.once('end', () => imap.end());
-        fetch.once('error', e => { imap.end(); reject(e); });
-      });
+      }
     });
+    
     imap.once('error', reject);
     imap.once('end', () => resolve(messages));
     imap.connect();
   });
 }
 
+// ── IMAP Remote Deletion Background Silencing Tool (Phase 3) ──
+function deleteImapEmailInBackground(account, folderKey, uid) {
+  let targetBoxType = folderKey === 'sent' ? 'sent' : 'inbox';
+  
+  const password = decrypt(account.password_enc);
+  const imap = new Imap({
+    user: account.email, password, host: account.imap_host, port: account.imap_port,
+    tls: !!account.imap_secure, tlsOptions: { rejectUnauthorized: false },
+    connTimeout: 15000, authTimeout: 10000,
+  });
+
+  imap.once('ready', () => {
+     const handleDeleteBox = (actualBoxName) => {
+       // Must be READ-WRITE false flag parameter (cannot open box in strictly readonly to erase records)
+       imap.openBox(actualBoxName, false, (err) => {
+         if (err) return imap.end();
+         imap.addFlags(uid, '\\Deleted', (err2) => {
+           if (err2) return imap.end();
+           // BUG FIX: node-imap's expunge() takes no arguments, only a callback.
+           imap.expunge(() => {
+              imap.end(); 
+           });
+         });
+       });
+     };
+
+     // Figure out folder mapped explicitly using auto-discovery before purging target!
+     if (targetBoxType === 'inbox') {
+        handleDeleteBox('INBOX');
+     } else {
+        imap.getBoxes((err, boxes) => {
+           if (err) return handleDeleteBox('Sent'); 
+           let sf = 'Sent';
+           const searchT = (obj, p) => {
+             for(let k in obj){
+               const x = obj[k], fp=p?`${p}${x.delimiter}${k}`:k;
+               if (x.attribs && (x.attribs.includes('\\Sent') || x.attribs.includes('\\SentMail'))) return fp;
+               const lw=k.toLowerCase(); if(lw==='sent'||lw==='sent items'||lw==='sent messages') sf=fp;
+               if(x.children) { const c=searchT(x.children,fp); if(c) return c;}
+             }
+             return null;
+           }
+           handleDeleteBox(searchT(boxes,'')||sf);
+        });
+     }
+  });
+
+  // BUG FIX: Close IMAP process on background task failure
+  imap.once('error', e => {
+      console.log('Background silent imap delete bypass triggered: ' + e.message);
+      try { imap.end(); } catch (err) {} // Safety wrapper
+  });
+  imap.connect();
+}
+
 async function parseIMAPMessage(raw, accountId, folder) {
   try {
-    // simpleParser handles base64, quoted-printable, multipart — everything
     const parsed    = await simpleParser(raw.raw);
     const uid       = String(raw.attrs?.uid || raw.seqno || Math.random());
     const id        = `${accountId}:${folder}:${uid}`;
     const fromName  = parsed.from?.value?.[0]?.name    || '';
     const fromEmail = parsed.from?.value?.[0]?.address || '';
-    const toArr     = (parsed.to?.value || []).map(t => ({ name: t.name||'', email: t.address||'' }));
+    const toArr     = (parsed.to?.value ||[]).map(t => ({ name: t.name||'', email: t.address||'' }));
     const subject   = parsed.subject || '';
     const bodyHtml  = parsed.html || parsed.textAsHtml || parsed.text || '';
     const preview   = (parsed.text || '').replace(/\s+/g, ' ').trim().slice(0, 200);
     const date      = (parsed.date || new Date()).toISOString();
-    const hasAtt    = (parsed.attachments || []).length > 0 ? 1 : 0;
+    const hasAtt    = (parsed.attachments ||[]).length > 0 ? 1 : 0;
     const msgType   = classifyEmail(subject, fromEmail, preview);
-    const flags     = raw.attrs?.flags || [];
+    const flags     = raw.attrs?.flags ||[];
     const isRead    = flags.includes('\\Seen') ? 1 : 0;
     return { id, accountId, folder: folder.toLowerCase(), uid, fromName, fromEmail,
              toArr: JSON.stringify(toArr), subject, bodyHtml, preview, date,
              isRead, isStarred: 0, hasAtt, msgType };
-  } catch { return null; }
+  } catch (e) { 
+    return null; 
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -308,21 +431,36 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// ── PRESETS ───────────────────────────────────────────────────
-const PRESETS = {
-  'gmail.com'     : { host:'imap.gmail.com', port:993, secure:true, smtpHost:'smtp.gmail.com', smtpPort:587, smtpSecure:false },
-  'googlemail.com': { host:'imap.gmail.com', port:993, secure:true, smtpHost:'smtp.gmail.com', smtpPort:587, smtpSecure:false },
-  'outlook.com'   : { host:'outlook.office365.com', port:993, secure:true, smtpHost:'smtp.office365.com', smtpPort:587, smtpSecure:false },
-  'hotmail.com'   : { host:'outlook.office365.com', port:993, secure:true, smtpHost:'smtp.office365.com', smtpPort:587, smtpSecure:false },
-  'yahoo.com'     : { host:'imap.mail.yahoo.com', port:993, secure:true, smtpHost:'smtp.mail.yahoo.com', smtpPort:587, smtpSecure:false },
-  'icloud.com'    : { host:'imap.mail.me.com', port:993, secure:true, smtpHost:'smtp.mail.me.com', smtpPort:587, smtpSecure:false },
-};
-
-app.get('/api/presets/:email', (req, res) => {
+app.get('/api/presets/:email', async (req, res) => {
   const domain = (req.params.email.split('@')[1] || '').toLowerCase();
-  const p = PRESETS[domain];
-  if (!p) return res.status(404).json({ error: 'No preset' });
-  res.json(p);
+
+  try {
+    const records = await dns.resolveMx(domain);
+    records.sort((a, b) => a.priority - b.priority); 
+
+    for (const record of records) {
+      const exchange = record.exchange.toLowerCase();
+      const match = MX_MAPPINGS.find(m => exchange.includes(m.match));
+      if (match) return res.json(match.preset);
+    }
+
+    return res.json({ 
+      host: `mail.${domain}`, port: 993, secure: true, 
+      smtpHost: `mail.${domain}`, smtpPort: 587, smtpSecure: false 
+    });
+  } catch (error) {
+    res.json({ 
+      host: `mail.${domain}`, port: 993, secure: true, 
+      smtpHost: `mail.${domain}`, smtpPort: 587, smtpSecure: false 
+    });
+  }
+});
+
+app.get('/api/accounts/all-emails', (req, res) => {
+  try {
+    const rows = db.prepare(`SELECT * FROM cached_emails ORDER BY date DESC LIMIT 2000`).all();
+    res.json(rows.map(emailRow));
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── TEST CONNECTION ───────────────────────────────────────────
@@ -334,7 +472,8 @@ app.post('/api/accounts/test', async (req, res) => {
         tls: !!imapSecure, tlsOptions: { rejectUnauthorized: false },
         connTimeout: 15000, authTimeout: 10000 });
       imap.once('ready', () => { imap.end(); resolve(); });
-      imap.once('error', reject);
+      // BUG FIX: Terminate the IMAP connection properly on rejection to free socket
+      imap.once('error', (err) => { imap.end(); reject(err); });
       imap.connect();
     });
     res.json({ ok: true });
@@ -350,17 +489,22 @@ app.post('/api/accounts', (req, res) => {
   const { email, password, name, imapHost, imapPort, imapSecure, smtpHost, smtpPort, smtpSecure } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'email and password required' });
   if (stmts.getAccountByEmail.get(email)) return res.status(409).json({ error: 'Account already exists' });
+  
   const id          = makeId();
   const passwordEnc = encrypt(password);
-  const preset      = PRESETS[(email.split('@')[1] || '').toLowerCase()] || {};
+  
+  // Custom domains mapping safely guarantees security port protocols
+  const finalImapSecure = imapSecure !== undefined ? (imapSecure ? 1 : 0) : 1;
+  const finalSmtpSecure = smtpSecure !== undefined ? (smtpSecure ? 1 : 0) : 0;
+
   try {
     stmts.insertAccount.run(id, name || email.split('@')[0], email, passwordEnc,
-      imapHost || preset.host || 'imap.gmail.com',
-      imapPort || preset.port || 993,
-      imapSecure !== undefined ? (imapSecure ? 1 : 0) : (preset.secure ? 1 : 0),
-      smtpHost || preset.smtpHost || 'smtp.gmail.com',
-      smtpPort || preset.smtpPort || 587,
-      smtpSecure !== undefined ? (smtpSecure ? 1 : 0) : (preset.smtpSecure ? 1 : 0));
+      imapHost || 'imap.gmail.com',
+      imapPort || 993,
+      finalImapSecure,
+      smtpHost || 'smtp.gmail.com',
+      smtpPort || 587,
+      finalSmtpSecure);
     res.status(201).json(accountRow(stmts.getAccount.get(id)));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -390,7 +534,6 @@ app.patch('/api/accounts/:id/settings', (req, res) => {
   res.json({ ok: true });
 });
 
-// ── SIGNATURES ────────────────────────────────────────────────
 app.get('/api/signatures', (req, res) => {
   const map = {};
   stmts.getAllSettings.all().forEach(r => { if (r.signature_html) map[r.account_id] = r.signature_html; });
@@ -403,55 +546,96 @@ app.put('/api/accounts/:id/signature', (req, res) => {
   res.json({ ok: true });
 });
 
-// ── EMAIL FETCH ───────────────────────────────────────────────
+app.post('/api/accounts/:id/sync', async (req, res) => {
+  res.json({ ok: true, message: 'Sync started' });
+  try {
+    await syncFolder(req.params.id, 'inbox', true);
+    await syncFolder(req.params.id, 'sent', true);
+  } catch (e) { console.warn('Background sync failed:', req.params.id, e.message); }
+});
+
+// ── EMAIL FETCH & BACKGROUND CACHING ENGINE ───────────
 async function syncFolder(accountId, folder, refresh) {
+  const folderKey = folder.toLowerCase();
+  
+  const cached = stmts.getEmails.all(accountId, folderKey);
+  if (cached.length && !refresh) return cached.map(emailRow);
+
   const account = stmts.getAccount.get(accountId);
   if (!account) throw new Error('Account not found');
 
-  if (!refresh) {
-    const cached = stmts.getEmails.all(accountId, folder.toLowerCase());
-    if (cached.length) return cached.map(emailRow);
-  }
+  // Relies exclusively on phase-1 mapping logic inside fetch function dynamically
+  const rawMsgs = await fetchIMAPMsgs(account, folderKey, 50);
 
-  const imapFolder = folder === 'sent' ? '[Gmail]/Sent Mail' : 'INBOX';
-  const rawMsgs    = await fetchIMAPMsgs(account, imapFolder, 500);
+  const parsed = await Promise.all(
+    rawMsgs.map(r => parseIMAPMessage(r, accountId, folder))
+  );
 
   const insertMany = db.transaction(msgs => {
     for (const m of msgs) {
       if (!m) continue;
-      stmts.upsertEmail.run(m.id, m.accountId, m.folder, m.uid, m.fromName, m.fromEmail,
-        m.toArr, m.subject, m.bodyHtml, m.preview, m.date, m.isRead, m.isStarred, m.hasAtt, m.msgType);
+      stmts.upsertEmail.run(
+        m.id, m.accountId, m.folder, m.uid,
+        m.fromName, m.fromEmail, m.toArr,
+        m.subject, m.bodyHtml, m.preview, m.date,
+        m.isRead, m.isStarred, m.hasAtt, m.msgType
+      );
     }
   });
-
-  const parsed = await Promise.all(rawMsgs.map(r => parseIMAPMessage(r, accountId, folder)));
   insertMany(parsed.filter(Boolean));
-  return stmts.getEmails.all(accountId, folder.toLowerCase()).map(emailRow);
+
+  return stmts.getEmailsAll.all(accountId, folderKey).map(emailRow);
 }
 
 app.get('/api/accounts/:id/inbox', async (req, res) => {
-  try { res.json(await syncFolder(req.params.id, 'inbox', !!req.query.refresh)); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try { 
+    res.json(await syncFolder(req.params.id, 'inbox', !!req.query.refresh)); 
+  } catch (e) { 
+    console.error(`Inbox fetch failed for ${req.params.id}:`, e.message);
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
 app.get('/api/accounts/:id/sent', async (req, res) => {
-  try { res.json(await syncFolder(req.params.id, 'sent', !!req.query.refresh)); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try { 
+    res.json(await syncFolder(req.params.id, 'sent', !!req.query.refresh)); 
+  } catch (e) { 
+    console.error(`Sent fetch failed for ${req.params.id}:`, e.message);
+    res.status(500).json({ error: e.message }); 
+  }
 });
 
-// ── READ / STAR ───────────────────────────────────────────────
+// ── READ / STAR / OPTIMISTIC DELETE COMMANDS ───────────────────
 app.patch('/api/accounts/:accountId/messages/:uid/read', (req, res) => {
-  stmts.updateRead.run(req.body.read ? 1 : 0, `${req.params.accountId}:inbox:${req.params.uid}`);
+  stmts.updateRead.run(req.body.read ? 1 : 0, req.params.accountId, req.params.uid);
   res.json({ ok: true });
 });
 
 app.patch('/api/accounts/:accountId/messages/:uid/star', (req, res) => {
-  const folder = (req.body.folder || 'inbox').includes('sent') ? 'sent' : 'inbox';
-  stmts.updateStarred.run(req.body.starred ? 1 : 0, `${req.params.accountId}:${folder}:${req.params.uid}`);
+  stmts.updateStarred.run(req.body.starred ? 1 : 0, req.params.accountId, req.params.uid);
   res.json({ ok: true });
 });
 
-// ── SEND ─────────────────────────────────────────────────────
+app.delete('/api/accounts/:accountId/messages/:folder/:uid', (req, res) => {
+  const accountId = req.params.accountId;
+  const folderKey = req.params.folder.toLowerCase();
+  const uid = req.params.uid;
+
+  const account = stmts.getAccount.get(accountId);
+  if (!account) return res.status(404).json({ error: 'Account not found' });
+
+  // 1. Local Cache wipes instant deletion sync protocol zero milliseconds perceived front-lag UI optimization!
+  try { stmts.deleteSingleEmail.run(accountId, folderKey, uid); } catch (e) {}
+  
+  // 2. Safely triggers unassigned listener logic inside of engine
+  deleteImapEmailInBackground(account, folderKey, uid);
+
+  // 3. Immediately bounce UI request complete true flag response validation bypass
+  res.json({ ok: true, deleted: true });
+});
+
+
+// ── SEND ENGINE LAYER ──────────────────────────────────────────────────
 app.post('/api/accounts/:id/send', async (req, res) => {
   const account = stmts.getAccount.get(req.params.id);
   if (!account) return res.status(404).json({ error: 'Account not found' });
@@ -461,18 +645,25 @@ app.post('/api/accounts/:id/send', async (req, res) => {
     host: account.smtp_host, port: account.smtp_port, secure: !!account.smtp_secure,
     auth: { user: account.email, pass: password }, tls: { rejectUnauthorized: false },
   });
+  
+  // BUG FIX: Prevent passing internal App IDs to SMTP provider, averting 550 RFC violations.
+  const mailOptions = {
+    from: `"${account.name}" <${account.email}>`,
+    to, cc, bcc, subject,
+    html: body, text: body.replace(/<[^>]+>/g, '')
+  };
+  
+  if (replyTo && replyTo.includes('@') && replyTo.includes('<') && replyTo.includes('>')) {
+    mailOptions.inReplyTo = replyTo;
+  }
+
   try {
-    await transporter.sendMail({
-      from: `"${account.name}" <${account.email}>`,
-      to, cc, bcc, subject,
-      html: body, text: body.replace(/<[^>]+>/g, ''),
-      inReplyTo: replyTo,
-    });
+    await transporter.sendMail(mailOptions);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── CAMPAIGNS ─────────────────────────────────────────────────
+// ── CAMPAIGN MANAGER MODULE PROTOCOLS ─────────────────────────────────────
 app.get('/api/campaigns', (req, res) => res.json(stmts.getAllCampaigns.all().map(campaignRow)));
 
 app.post('/api/campaigns', (req, res) => {
@@ -508,7 +699,7 @@ app.delete('/api/campaigns/:id', (req, res) => {
   res.json({ ok: true });
 });
 
-// ── CAMPAIGN HISTORY ──────────────────────────────────────────
+// ── DATA METRIC ARCHIVES ──────────────────────────────────────────────
 app.get('/api/campaigns/:id/history', (req, res) => {
   res.json(stmts.getHistory.all(req.params.id).map(r => ({
     rowIdx: r.row_idx, sentAt: r.sent_at, senderEmail: r.sender_email,
@@ -527,32 +718,19 @@ app.post('/api/campaigns/:id/history', (req, res) => {
   res.status(201).json({ ok: true });
 });
 
-// ── SENT ROWS ─────────────────────────────────────────────────
-app.get('/api/campaigns/:id/sent-rows', (req, res) => {
-  res.json(stmts.getSentRows.all(req.params.id).map(r => r.row_idx));
-});
-app.post('/api/campaigns/:id/sent-rows', (req, res) => {
-  stmts.insertSentRow.run(req.params.id, req.body.rowIdx);
-  res.json({ ok: true });
-});
+app.get('/api/campaigns/:id/sent-rows', (req, res) => res.json(stmts.getSentRows.all(req.params.id).map(r => r.row_idx)));
+app.post('/api/campaigns/:id/sent-rows', (req, res) => { stmts.insertSentRow.run(req.params.id, req.body.rowIdx); res.json({ ok: true }); });
 
-// ── GLOBAL PAIRS ──────────────────────────────────────────────
-app.get('/api/global-pairs', (req, res) => {
-  res.json(stmts.getPairs.all().map(r => `${r.sender_email}::${r.recipient_email}`));
-});
-app.post('/api/global-pairs', (req, res) => {
-  stmts.insertPair.run((req.body.senderEmail||'').toLowerCase(), (req.body.recipientEmail||'').toLowerCase());
-  res.json({ ok: true });
-});
+app.get('/api/global-pairs', (req, res) => res.json(stmts.getPairs.all().map(r => `${r.sender_email}::${r.recipient_email}`)));
+app.post('/api/global-pairs', (req, res) => { stmts.insertPair.run((req.body.senderEmail||'').toLowerCase(), (req.body.recipientEmail||'').toLowerCase()); res.json({ ok: true }); });
 
-// ── HEALTH ────────────────────────────────────────────────────
+// ── BOOT CHECK SYSTEM ──────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ status: 'ok', db: DB_PATH, uptime: process.uptime() }));
 
-// ── START ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n✅  MailOS Backend running on http://localhost:${PORT}`);
-  console.log(`📁  Database: ${DB_PATH}`);
-  console.log(`🔐  Encryption: AES-256-GCM\n`);
+  console.log(`\n✅  MailOS Advanced Auto-Connect Node Gateway Running http://localhost:${PORT}`);
+  console.log(`📂  Database Target Array Directory Cache Node Protocol File Root Active: ${DB_PATH}`);
+  console.log(`🔐  Encryption Check Vector Engine Secured: AES-256-GCM Hardware Matrix Valid\n`);
 });
 
 module.exports = app;

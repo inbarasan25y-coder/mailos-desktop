@@ -264,7 +264,7 @@ const stmts = {
   getAllCampaignsFull: db.prepare(`SELECT * FROM campaigns ORDER BY created_at DESC`),
   deleteCampaign   : db.prepare(`DELETE FROM campaigns WHERE id=?`),
 
-  insertHistory    : db.prepare(`INSERT INTO campaign_history(campaign_id,row_idx,sent_at,sender_email,sender_name,to_email,subject,body_html,row_data,touch_type,track_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)`),
+  insertHistory    : db.prepare(`INSERT OR IGNORE INTO campaign_history(campaign_id,row_idx,sent_at,sender_email,sender_name,to_email,subject,body_html,row_data,touch_type,track_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)`),
   getHistory: db.prepare(`SELECT id,row_idx,sent_at,sender_email,sender_name,to_email,subject,body_html,touch_type,row_data,track_id FROM campaign_history WHERE campaign_id=? ORDER BY sent_at ASC LIMIT 5000`),
   deleteHistory    : db.prepare(`DELETE FROM campaign_history WHERE campaign_id=?`),
 
@@ -1461,6 +1461,7 @@ const mailOptions = {
 // ── Safe migrations
 try { db.exec(`ALTER TABLE email_tracking ADD COLUMN subject TEXT DEFAULT ''`); } catch {}
 try { db.exec(`ALTER TABLE cached_emails ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'`); } catch {}
+try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_hist_unique_recipient ON campaign_history(campaign_id, lower(to_email), touch_type)`); } catch {}
 
 // ── Attachment list for a message (from cached metadata)
 app.get('/api/accounts/:accountId/messages/:uid/attachments', (req,res)=>{
@@ -1653,10 +1654,9 @@ app.post('/api/campaigns/:id/history', (req, res) => {
       }
       const existing = db.prepare(`
         SELECT id FROM campaign_history
-        WHERE campaign_id=? AND to_email=? AND touch_type=?
-          AND strftime('%Y-%m-%dT%H:%M', sent_at)=strftime('%Y-%m-%dT%H:%M', ?)
+        WHERE campaign_id=? AND lower(to_email)=lower(?) AND touch_type=?
         LIMIT 1
-      `).get(req.params.id, b.toEmail, b.touchType || 'first', sentAtNorm);
+      `).get(req.params.id, b.toEmail, b.touchType || 'first');
 
       if (existing) return { duplicate: true };
 

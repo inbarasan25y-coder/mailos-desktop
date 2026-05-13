@@ -2228,15 +2228,38 @@ const delCamp = id => {
     if(ec<0)return alert('No email column found.');
     const sIds=snap.senderIds||[];if(!sIds.length)return alert('Select at least one sender.');
     const rows=snap.csvRows||[];
-    const doneSet=new Set(ls.get('mOS_sentRows_'+id,[]));
+
+    // ── LAYER 1: row-index dedup from LS + DB
+    const doneSet=new Set((ls.get('mOS_sentRows_'+id,[])||[]).map(Number));
     try{
       const dbRows=await apiFetch('/campaigns/'+id+'/sent-rows',{timeout:10000});
-      if(dbRows?.length){dbRows.forEach(ri=>doneSet.add(ri));ls.set('mOS_sentRows_'+id,[...doneSet]);}
+      if(dbRows?.length){dbRows.forEach(ri=>doneSet.add(Number(ri)));}
     }catch{}
-    const queue=rows.map((_,i)=>i).filter(i=>!doneSet.has(i)).map(ri=>({ri,failed:new Set()}));
-    if(!queue.length)return alert('Campaign already complete.');
+
+    // ── LAYER 2: email-address dedup from history (survives stop/reload/relaunch)
+    const sentEmailSet=new Set();
+    try{
+      const hist=await apiFetch('/campaigns/'+id+'/history',{timeout:20000});
+      if(Array.isArray(hist)){
+        hist.filter(h=>!h.touchType||h.touchType==='first').forEach(h=>{
+          if(h.toEmail)sentEmailSet.add(h.toEmail.toLowerCase().trim());
+          if(h.rowIdx!=null)doneSet.add(Number(h.rowIdx));
+        });
+      }
+    }catch{}
+    // Sync the now-complete doneSet back to LS so next load is instant
+    ls.set('mOS_sentRows_'+id,[...doneSet]);
+
+    // ── Build queue: skip if EITHER row index OR email address already done
+    const queue=rows
+      .map((r,i)=>({ri:i,email:((r||[])[ec]||'').trim().toLowerCase()}))
+      .filter(({ri,email})=>!doneSet.has(ri)&&!(email&&sentEmailSet.has(email)))
+      .map(({ri})=>({ri,failed:new Set()}));
+
+    if(!queue.length)return alert('Campaign complete — all recipients have already been emailed.');
 
     initEng(id);setTab('progress');
+    // sent counter starts from actual already-sent count, not 0
     setProg(id,{type:'first',status:'running',sent:doneSet.size,total:rows.length,errors:[],startTime:new Date()});
     const getNext=sid=>{for(let i=0;i<queue.length;i++){if(!queue[i].failed.has(sid))return queue.splice(i,1)[0];}return null;};
 
@@ -2248,6 +2271,15 @@ const delCamp = id => {
         const item=getNext(sid);if(!item)break;
         const{ri}=item;
         const toEmail=((rows[ri]||[])[ec]||'').trim();if(!toEmail)continue;
+
+        // ── EMAIL-LEVEL guard: catches any rows that slipped through queue filter
+        if(sentEmailSet.has(toEmail.toLowerCase())){
+          doneSet.add(ri);
+          ls.set('mOS_sentRows_'+id,[...doneSet]);
+          apiFetch('/campaigns/'+id+'/sent-rows',{method:'POST',body:JSON.stringify({rowIdx:ri})}).catch(()=>{});
+          continue;
+        }
+
         const acc=accounts.find(a=>a.id===sid)||{};
         const cfg=accountSettings[sid]||{};
         const ms=(cfg.minDelay??60)*1000+Math.random()*((cfg.maxDelay??180)-(cfg.minDelay??60))*1000;
@@ -2261,48 +2293,41 @@ const delCamp = id => {
         body=normalizeForOutlook(resolve(body,m).replace(/\{\{[^}]+\}\}/g,''));
         const subj=resolve(snap.subject||'',m);
         try{
-          const rowTrackId = `trk_${id}_${ri}_${Date.now().toString(36)}`;
-          
-          // 1. Send the Email
+          const rowTrackId=`trk_${id}_${ri}_${Date.now().toString(36)}`;
           await apiFetch('/accounts/'+sid+'/send',{method:'POST',timeout:300000,body:JSON.stringify({to:toEmail,subject:subj,body,trackId:rowTrackId})});
           
           const histEntry={rowIdx:ri,sentAt:new Date().toISOString(),senderEmail:acc.email||sid,senderName:acc.name||'',toEmail,subject:subj,
-            bodyHTML:body,
-            rowData:rows[ri],touchType:'first',trackId:rowTrackId};
+            bodyHTML:body,rowData:rows[ri],touchType:'first',trackId:rowTrackId};
 
-          // 2. 🔥 FIX 2: Await Server DB Save BEFORE updating counter! (No catch, so errors fail the block safely)
-          // History save in its own try-catch — a DB timeout never shows as "Request timed out" in log
-          try {
+          try{
             await apiFetch('/campaigns/'+id+'/history',{
-              method:'POST', timeout:90000,
-              body:JSON.stringify({...histEntry, bodyHTML:body.slice(0,100000)})
+              method:'POST',timeout:90000,
+              body:JSON.stringify({...histEntry,bodyHTML:body.slice(0,100000)})
             });
-          } catch(histErr) {
-            console.warn('History save failed, retrying in 8s:', histErr.message);
-            const _retryPayload = JSON.stringify({...histEntry, bodyHTML:body.slice(0,100000)});
-            setTimeout(()=> apiFetch('/campaigns/'+id+'/history',{method:'POST',timeout:60000,body:_retryPayload}).catch(()=>{}), 8000);
+          }catch(histErr){
+            console.warn('History save failed, retrying in 8s:',histErr.message);
+            const _retryPayload=JSON.stringify({...histEntry,bodyHTML:body.slice(0,100000)});
+            setTimeout(()=>apiFetch('/campaigns/'+id+'/history',{method:'POST',timeout:60000,body:_retryPayload}).catch(()=>{}),8000);
           }
 
-          // 3. DB save confirmed -> Update Frontend memory (with bodyHTML) + LS (without for space)
-          setHistData(prev => ({ ...prev, [id]: [...(prev[id] || []), histEntry] }));
-          // LS stores without bodyHTML to save space — bodyHTML lives in state + server DB
-          await lsAppendSafe('mOS_hist_' + id, {
-              rowIdx: histEntry.rowIdx, sentAt: histEntry.sentAt,
-              senderEmail: histEntry.senderEmail, senderName: histEntry.senderName,
-              toEmail: histEntry.toEmail, subject: histEntry.subject,
-              rowData: histEntry.rowData, touchType: histEntry.touchType,
-              trackId: histEntry.trackId, bodyHTML: ''
+          setHistData(prev=>({...prev,[id]:[...(prev[id]||[]),histEntry]}));
+          await lsAppendSafe('mOS_hist_'+id,{
+            rowIdx:histEntry.rowIdx,sentAt:histEntry.sentAt,
+            senderEmail:histEntry.senderEmail,senderName:histEntry.senderName,
+            toEmail:histEntry.toEmail,subject:histEntry.subject,
+            rowData:histEntry.rowData,touchType:histEntry.touchType,
+            trackId:histEntry.trackId,bodyHTML:''
           });
           setHistVersion(v=>v+1);
-          
+
+          // ── Mark done in ALL dedup stores immediately after confirmed send
+          sentEmailSet.add(toEmail.toLowerCase());
           doneSet.add(ri);
           ls.set('mOS_sentRows_'+id,[...doneSet]);
           apiFetch('/campaigns/'+id+'/sent-rows',{method:'POST',body:JSON.stringify({rowIdx:ri})}).catch(()=>{});
 
           const li2=e.logs.findIndex(l=>l.row===ri+1);if(li2!==-1)e.logs[li2].status='sent';
-          
-          // 4. ATOMIC INCREMENT (Using the safe queue to perfectly count +1)
-          setProg(id, cur => ({ sent: (cur.sent || 0) + 1 }));
+          setProg(id,cur=>({sent:(cur.sent||0)+1}));
         }catch(err){
           const et=smtpErr(err.message);
           e.errors=[{senderEmail:acc.email||sid,toEmail,reason:et},...e.errors].slice(0,50);
@@ -2315,7 +2340,6 @@ const delCamp = id => {
       }
     }));
     setProg(id,{status:engRef.current[id]?.abort?'stopped':'done',endTime:new Date()});
-    // Check final physical size of doneSet rather than memory counter
     onUpdateCampaigns(prev=>prev.map(c=>c.id===snap.id?{...c,status:doneSet.size>=rows.length?'sent':c.status}:c));
   };
 
@@ -2920,8 +2944,24 @@ const delCamp = id => {
                     <div style={{display:'flex',gap:10,alignItems:'center'}}>
                       <input value={histSrch} onChange={e=>setHistSrch(e.target.value)} placeholder="Filter…" className="inp" style={{minWidth:200,padding:'7px 12px',fontSize:12}}/>
                       {hist.length>0&&<button onClick={()=>{
-                        const hdr=['#','From','To','Subject','Date','Stage','Opened','Clicked','Bounced','AutoReply','Replied',...selH];
-                        expCSV(hist.map((r,i)=>Object.fromEntries(hdr.map((k,j)=>[k,[i+1,r.senderEmail,r.toEmail,r.subject,r.sentAt,r.touchType||'first',r.opened?'Yes':'No',r.clicked?'Yes':'No',r.bounced?'Yes':'No',r.autoReply?'Yes':'No',r.replied?'Yes':'No',...(r.rowData||[])][j]]))),'history.csv');
+                        const colHeaders=['#','Sender Name','Sender Email','To Email','Subject','Sent At','Stage','Opened','Clicked','Bounced','Auto-Reply','Replied',...selH];
+                        const csvRows=[colHeaders,...hist.map((r,i)=>[
+                          i+1,
+                          r.senderName||'',
+                          r.senderEmail||'',
+                          r.toEmail||'',
+                          r.subject||'',
+                          r.sentAt?new Date(r.sentAt).toLocaleString():'',
+                          r.touchType==='followup'?'Follow-up':'First Touch',
+                          r.opened?'Yes':'No',
+                          r.clicked?'Yes':'No',
+                          r.bounced?'Yes':'No',
+                          r.autoReply?'Yes':'No',
+                          r.replied?'Yes':'No',
+                          ...(selH.map((_,ci)=>(r.rowData||[])[ci]||''))
+                        ])];
+                        const csv=csvRows.map(row=>row.map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(',')).join('\n');
+                        dl(new Blob([csv],{type:'text/csv;charset=utf-8'}),'history.csv');
                       }} className="btn bg" style={{padding:'7px 14px',fontSize:12}}><Ic.Down s={12}/> Export</button>}
                     </div>
                   </div>

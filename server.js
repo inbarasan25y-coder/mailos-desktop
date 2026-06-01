@@ -221,11 +221,19 @@ const indexes = [
   `CREATE INDEX IF NOT EXISTS idx_history_campaign     ON campaign_history(campaign_id)`,
   `CREATE INDEX IF NOT EXISTS idx_history_touch        ON campaign_history(campaign_id, touch_type)`,
   `CREATE INDEX IF NOT EXISTS idx_email_folder_lower   ON cached_emails(account_id, lower(folder))`,
+  // NEW: critical missing indexes for hot paths
+  `CREATE INDEX IF NOT EXISTS idx_history_to_email     ON campaign_history(campaign_id, lower(to_email))`,
+  `CREATE INDEX IF NOT EXISTS idx_tracking_campaign    ON email_tracking(campaign_id, sender_email)`,
+  `CREATE INDEX IF NOT EXISTS idx_tracking_to_email    ON email_tracking(to_email)`,
+  `CREATE INDEX IF NOT EXISTS idx_sent_rows_camp       ON sent_rows(campaign_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_history_track_id      ON campaign_history(campaign_id, track_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_history_email_touch   ON campaign_history(campaign_id, lower(to_email), touch_type)`,
 ];
 indexes.forEach(idx => { try { db.exec(idx); } catch(_) {} });
 
 // Safe migration — adds track_id if upgrading from older DB
 try { db.exec(`ALTER TABLE campaign_history ADD COLUMN track_id TEXT NOT NULL DEFAULT ''`); } catch {}
+try { db.exec(`ALTER TABLE campaigns ADD COLUMN skip_list TEXT NOT NULL DEFAULT ''`); } catch {}
 // ═══════════════════════════════════════════════════════════════
 // PREPARED STATEMENTS
 // ═══════════════════════════════════════════════════════════════
@@ -249,7 +257,7 @@ const stmts = {
   getEmailsPage    : db.prepare(`SELECT * FROM cached_emails WHERE account_id=? AND lower(folder)=lower(?) ORDER BY date DESC LIMIT ? OFFSET ?`),
   getEmailCount    : db.prepare(`SELECT COUNT(*) as cnt FROM cached_emails WHERE account_id=? AND lower(folder)=lower(?)`),
 
-  upsertEmail      : db.prepare(`INSERT INTO cached_emails(id,account_id,folder,uid,from_name,from_email,to_json,subject,body_html,preview,date,is_read,is_starred,has_attachment,msg_type,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now')) ON CONFLICT(id) DO UPDATE SET body_html=excluded.body_html, preview=excluded.preview, is_read=excluded.is_read, is_starred=excluded.is_starred, fetched_at=excluded.fetched_at`),
+  upsertEmail      : db.prepare(`INSERT INTO cached_emails(id,account_id,folder,uid,from_name,from_email,to_json,subject,body_html,preview,date,is_read,is_starred,has_attachment,msg_type,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now')) ON CONFLICT(id) DO UPDATE SET body_html=excluded.body_html, preview=excluded.preview, is_read=MAX(is_read, excluded.is_read), is_starred=excluded.is_starred, fetched_at=excluded.fetched_at`),
   updateRead       : db.prepare(`UPDATE cached_emails SET is_read=? WHERE account_id=? AND uid=?`),
   updateStarred    : db.prepare(`UPDATE cached_emails SET is_starred=? WHERE account_id=? AND uid=?`),
   deleteAccEmails  : db.prepare(`DELETE FROM cached_emails WHERE account_id=?`),
@@ -259,6 +267,7 @@ const stmts = {
 
   insertCampaign   : db.prepare(`INSERT INTO campaigns(id,name,subject,pitch,fu_pitch,fu_subject,email_col,csv_headers,csv_rows,sender_ids,batch_size,batch_delay_min,batch_delay_max,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`),
   updateCampaign   : db.prepare(`UPDATE campaigns SET name=?,subject=?,pitch=?,fu_pitch=?,fu_subject=?,email_col=?,csv_headers=?,csv_rows=?,sender_ids=?,batch_size=?,batch_delay_min=?,batch_delay_max=?,status=?,updated_at=datetime('now') WHERE id=?`),
+  updateCampaignFast: db.prepare(`UPDATE campaigns SET updated_at=datetime('now') WHERE id=?`),
   getCampaign      : db.prepare(`SELECT * FROM campaigns WHERE id=?`),
   getAllCampaigns   : db.prepare(`SELECT id,name,subject,email_col,sender_ids,status,created_at,updated_at FROM campaigns ORDER BY created_at DESC`),
   getAllCampaignsFull: db.prepare(`SELECT * FROM campaigns ORDER BY created_at DESC`),
@@ -345,6 +354,74 @@ async function networkRetry(operation, maxRetries = 3, delayMs = 2500) {
     }
   }
   throw lastError;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SMTP TRANSPORTER POOL (Auto-cleaning & Timeout Protected)
+// ═══════════════════════════════════════════════════════════════
+const _smtpPool  = new Map(); 
+const _smtpSendCount = new Map(); 
+const SMTP_RECYCLE_AFTER = 80;    // force fresh connection every 80 sends
+
+function evictTransporter(id) {
+  const tr = _smtpPool.get(id);
+  if (tr) { try { tr.close(); } catch {} }
+  _smtpPool.delete(id);
+  _smtpSendCount.delete(id);
+}
+
+async function smtpSend(account, mailOptions) {
+  const key = account.id;
+  let tr = _smtpPool.get(key);
+  const count = _smtpSendCount.get(key) || 0;
+
+  // Force-recreate after N sends — SMTP servers drop long-lived connections
+  if (!tr || count >= SMTP_RECYCLE_AFTER) {
+    if (tr) { try { tr.close(); } catch {} }
+    const password = decrypt(account.password_enc);
+    const smtpPort = parseInt(account.smtp_port, 10) || 587;
+    const smtpSecure = smtpPort === 465;
+
+    tr = nodemailer.createTransport({
+      host:             account.smtp_host,
+      port:             smtpPort,
+      secure:           smtpSecure,
+      auth:             { user: account.email, pass: password },
+      connectionTimeout: 20000,
+      greetingTimeout:   15000,
+      socketTimeout:     30000,
+      pool:              false, // we manage our own pool
+      tls:               { rejectUnauthorized: false, servername: account.smtp_host, minVersion: 'TLSv1' },
+    });
+    _smtpPool.set(key, tr);
+    _smtpSendCount.set(key, 0);
+  }
+
+  // Hard 35s timeout — prevents any single send from hanging forever
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      // Kill the dead transporter so next send gets a fresh one
+      try { tr.close(); } catch {}
+      _smtpPool.delete(key);
+      _smtpSendCount.delete(key);
+      reject(new Error('SMTP timeout after 35s'));
+    }, 35000);
+
+    tr.sendMail(mailOptions)
+      .then(info => {
+        clearTimeout(timer);
+        _smtpSendCount.set(key, (_smtpSendCount.get(key) || 0) + 1);
+        resolve(info);
+      })
+      .catch(err => {
+        clearTimeout(timer);
+        // Any SMTP error → remove from pool so next attempt is a fresh connection
+        try { tr.close(); } catch {}
+        _smtpPool.delete(key);
+        _smtpSendCount.delete(key);
+        reject(err);
+      });
+  });
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -523,7 +600,7 @@ function makeImap(account) {
   });
 
   // CRITICAL: Suppresses unhandled underlying stream exceptions emitted silently
-  imap.on('error', () => {}); 
+  imap.on('error', (err) => { console.error('[IMAP Error]', err); }); 
   return imap;
 }
 
@@ -577,56 +654,99 @@ async function parseIMAPMessage(raw, accountId, folderKey) {
 // ═══════════════════════════════════════════════════════════════
 // INCREMENTAL IMAP FETCH
 // ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// INCREMENTAL IMAP FETCH (Self-Healing & Bulletproof)
+// ═══════════════════════════════════════════════════════════════
 async function fetchIMAPMsgsSince(account, folderPath, sinceUid = 0) {
   const release = await imapSlot();
   return new Promise((resolve, reject) => {
     let isFinished = false;
     const imap     = makeImap(account);
-    const messages =[];
+    const messages = [];
 
     const cleanup = (error, data) => {
       if (isFinished) return;
       isFinished = true;
       clearTimeout(timer);
-      try { imap.destroy(); } catch {} // Force-clear connections upon error
+      try { imap.destroy(); } catch {}
       release();
-      if (error) reject(error); 
+      if (error) reject(error);
       else resolve(data);
     };
 
-    const timer = setTimeout(() => cleanup(null,[]), 75000); // hard reset failsafe limit
+    const timer = setTimeout(() => cleanup(null, []), 85000);
 
     imap.once('ready', () => {
       imap.openBox(folderPath, true, (err, box) => {
-        if (err || !box || box.messages.total === 0) return cleanup(null,[]);
+        if (err || !box) return cleanup(null, []);
+        if (box.messages.total === 0) return cleanup(null, []);
 
-        let criteria = sinceUid > 0 
-          ? [['UID', `${sinceUid + 1}:*`]]
-          : [['SINCE', (() => { 
-              const d = new Date(); d.setMonth(d.getMonth() - 3); 
-              return `${String(d.getDate()).padStart(2, '0')}-${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()]}-${d.getFullYear()}`; 
-            })()]];
+        const totalMsgs = box.messages.total;
 
-        imap.search(criteria, (e2, uids) => {
-          if (e2 || !uids?.length) return cleanup(null,[]);
+        // Strategy 1: If we have sinceUid, try UID-range fetch first (fastest)
+        if (sinceUid > 0) {
+          const uidRange = `${sinceUid + 1}:*`;
+          imap.search([['UID', uidRange]], (searchErr, newUids) => {
+            if (searchErr || !newUids) newUids = [];
 
-          const fetchUids = uids.slice(-300); // max 300 items fetching simultaneously safely
-          const fetchStream = imap.fetch(fetchUids, { bodies: '', struct: true });
-          
+            // Always include last 75 as self-healing window
+            const startSeq = Math.max(1, totalMsgs - 74);
+            const seqRange = `${startSeq}:${totalMsgs}`;
+
+            imap.search([['ALL']], (_, allUids) => {
+              if (!allUids) allUids = [];
+              // Get UIDs for last 75 by sequence (sequence search not directly possible,
+              // so we use the full UID list sliced)
+              const last75Uids = allUids.slice(-75);
+              const merged = [...new Set([...newUids, ...last75Uids])].slice(-350);
+
+              if (!merged.length) return cleanup(null, []);
+              doFetch(merged);
+            });
+          });
+        } else {
+          // Strategy 2: Fresh account — fetch by date (last 90 days) OR last 200 by sequence
+          const d = new Date();
+          d.setDate(d.getDate() - 90);
+          const sinceStr = `${String(d.getDate()).padStart(2,'0')}-${['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getMonth()]}-${d.getFullYear()}`;
+
+          imap.search([['SINCE', sinceStr]], (e2, uids) => {
+            if (e2 || !uids || !uids.length) {
+              // Fallback: fetch last 200 by sequence number
+              const startSeq = Math.max(1, totalMsgs - 199);
+              const fetchStream = imap.fetch(`${startSeq}:${totalMsgs}`, { bodies: '', struct: true });
+              handleFetchStream(fetchStream);
+              return;
+            }
+            const toFetch = uids.slice(-350);
+            doFetch(toFetch);
+          });
+        }
+
+        function doFetch(uids) {
+          if (!uids.length) return cleanup(null, []);
+          try {
+            const fetchStream = imap.fetch(uids, { bodies: '', struct: true });
+            handleFetchStream(fetchStream);
+          } catch (e) {
+            cleanup(e, null);
+          }
+        }
+
+        function handleFetchStream(fetchStream) {
           fetchStream.on('message', msg => {
-            let chunks =[], attrs = {};
+            let chunks = [], attrs = {};
             msg.on('body', stream => stream.on('data', c => chunks.push(c)));
             msg.once('attributes', a => { attrs = a; });
             msg.once('end', () => messages.push({ raw: Buffer.concat(chunks), attrs }));
           });
-          
           fetchStream.once('end', () => cleanup(null, messages));
-          fetchStream.on('error', e3 => cleanup(e3, null));
-        });
+          fetchStream.on('error', e => cleanup(e, null));
+        }
       });
     });
 
-    imap.on('error', e => cleanup(e, null)); // Swallows ALL ECONNRESET noise cleanly
+    imap.on('error', e => cleanup(e, null));
     imap.on('end', () => cleanup(null, messages));
     imap.connect();
   });
@@ -660,6 +780,57 @@ function deleteImapEmailInBackground(account, folderPath, uid) {
   imap.on('error', cleanup);
   imap.on('end', cleanup);
   imap.connect();
+}
+
+function setImapReadFlagBackground(account, uid, markRead) {
+  (async () => {
+    const release = await imapSlot();
+    const imap = makeImap(account);
+    let done = false;
+
+    const cleanup = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try { imap.destroy(); } catch {}
+      release();
+    };
+
+    const timer = setTimeout(cleanup, 20000);
+
+    imap.once('ready', () => {
+      try {
+        // Look up the folder this UID lives in
+        const row = db.prepare(
+          'SELECT folder FROM cached_emails WHERE account_id=? AND uid=? LIMIT 1'
+        ).get(account.id, String(uid));
+        const folderKey = row?.folder || 'inbox';
+
+        // Resolve real case-sensitive folder name from cache
+        let realFolder = folderKey;
+        const fc = stmts.getFolderCache.get(account.id);
+        if (fc?.folders_json) {
+          try {
+            const found = safeJson(fc.folders_json, [])
+              .find(f => f.fullPath.toLowerCase() === folderKey.toLowerCase());
+            if (found) realFolder = found.fullPath;
+          } catch {}
+        }
+
+        imap.openBox(realFolder, false, (err) => {
+          if (err) return cleanup();
+          const op = markRead
+            ? cb => imap.uid.addFlags(String(uid), '\\Seen', cb)
+            : cb => imap.uid.delFlags(String(uid), '\\Seen', cb);
+          op(() => cleanup());
+        });
+      } catch { cleanup(); }
+    });
+
+    imap.on('error', cleanup);
+    imap.on('end', () => { if (!done) cleanup(); });
+    imap.connect();
+  })().catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -865,28 +1036,23 @@ async function scanInboxForTracking(account, campaignId, trackingMap) {
   });
 }
 
-// Persist scan results to DB
+// ── Pre-compiled per-type UPDATE statements (compiled once, reused forever)
+const _trackUpd = {
+  open:   db.prepare(`UPDATE email_tracking SET opened=1, open_count=open_count+1, first_open_at=COALESCE(first_open_at,datetime('now')) WHERE id=?`),
+  bounce: db.prepare(`UPDATE email_tracking SET bounced=1 WHERE id=?`),
+  auto:   db.prepare(`UPDATE email_tracking SET auto_reply=1 WHERE id=?`),
+  reply:  db.prepare(`UPDATE email_tracking SET replied=1 WHERE id=?`),
+};
+const _trackBatch = db.transaction((rows) => {
+  for (const r of rows) {
+    const stmt = _trackUpd[r.type];
+    if (stmt) stmt.run(r.trackId);
+  }
+});
+
 function applyTrackingResults(results) {
-  const upd = db.prepare(`
-    UPDATE email_tracking SET
-      opened    = CASE WHEN ? = 1 THEN 1 ELSE opened END,
-      open_count= CASE WHEN ? = 1 THEN open_count+1 ELSE open_count END,
-      first_open_at = CASE WHEN ? = 1 AND first_open_at IS NULL THEN datetime('now') ELSE first_open_at END,
-      bounced   = CASE WHEN ? = 1 THEN 1 ELSE bounced END,
-      auto_reply= CASE WHEN ? = 1 THEN 1 ELSE auto_reply END,
-      replied   = CASE WHEN ? = 1 THEN 1 ELSE replied END
-    WHERE id = ?
-  `);
-  const tx = db.transaction(rows => {
-    for (const r of rows) {
-      const isOpen   = r.type === 'open'   ? 1 : 0;
-      const isBounce = r.type === 'bounce' ? 1 : 0;
-      const isAuto   = r.type === 'auto'   ? 1 : 0;
-      const isReply  = r.type === 'reply'  ? 1 : 0;
-      upd.run(isOpen, isOpen, isOpen, isBounce, isAuto, isReply, r.trackId);
-    }
-  });
-  tx(results);
+  if (!results.length) return;
+  _trackBatch(results);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -895,6 +1061,28 @@ function applyTrackingResults(results) {
 const app = express();
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || true }));
 app.use(express.json({ limit: '20mb' }));
+
+// ── Gzip compression — cuts response size 60-85% for email bodies
+const zlib = require('zlib');
+app.use((req, res, next) => {
+  const ae = req.headers['accept-encoding'] || '';
+  if (!ae.includes('gzip')) return next();
+  const _json = res.json.bind(res);
+  res.json = (data) => {
+    const buf = Buffer.from(JSON.stringify(data), 'utf8');
+    if (buf.length < 1024) return _json(data); // skip tiny payloads
+    zlib.gzip(buf, { level: 1 }, (err, compressed) => { // level 1 = fastest
+      if (err) return _json(data);
+      if (!res.headersSent) {
+        res.setHeader('Content-Encoding', 'gzip');
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Length', compressed.length);
+        res.end(compressed);
+      }
+    });
+  };
+  next();
+});
 
 // ── Request timeout middleware
 app.use((req, res, next) => {
@@ -1198,6 +1386,7 @@ app.get('/api/accounts/:id/emails', async (req, res) => {
     const rows = stmts.getEmailsPage.all(req.params.id, folderKey, limit, page * limit);
     res.json(rows.map(emailRow));
   } catch (e) {
+    console.error('[IMAP Refresh Error]', e);
     // Always fall back to DB cache on IMAP error
     const rows = stmts.getEmailsPage.all(req.params.id, folderKey, limit, page * limit);
     res.json(rows.map(emailRow));
@@ -1206,8 +1395,14 @@ app.get('/api/accounts/:id/emails', async (req, res) => {
 
 // ── Read / Star
 app.patch('/api/accounts/:accountId/messages/:uid/read', (req, res) => {
-  stmts.updateRead.run(req.body.read ? 1 : 0, req.params.accountId, req.params.uid);
-  res.json({ ok: true });
+  const readVal = req.body.read ? 1 : 0;
+  stmts.updateRead.run(readVal, req.params.accountId, req.params.uid);
+  res.json({ ok: true }); // respond immediately — IMAP update is fire-and-forget
+
+  // Push \Seen / \Unseen flag to real IMAP server in background
+  // This is what syncs the read state to Gmail, Outlook, Apple Mail, etc.
+  const account = stmts.getAccount.get(req.params.accountId);
+  if (account) setImapReadFlagBackground(account, req.params.uid, readVal === 1);
 });
 
 app.patch('/api/accounts/:accountId/messages/:uid/star', (req, res) => {
@@ -1411,25 +1606,19 @@ const mailOptions = {
   if (bcc) mailOptions.bcc = bcc;
 
   try {
-    const info = await networkRetry(async () => {
-  const smtpPort   = parseInt(account.smtp_port, 10) || 587;
-  const smtpSecure = smtpPort === 465;
-  const transporter = nodemailer.createTransport({
-    host: account.smtp_host, port: smtpPort, secure: smtpSecure,
-    auth: { user: account.email, pass: password },
-    tls: { rejectUnauthorized: false, servername: account.smtp_host, minVersion: 'TLSv1' },
-    connectionTimeout: 45000, greetingTimeout: 20000, socketTimeout: 60000,
-    pool: false,
-  });
-  try {
-    const result = await transporter.sendMail(mailOptions);
-    transporter.close();
-    return result;
-  } catch (err) {
-    transporter.close();
-    throw err;
-  }
-}, 1, 500);
+    let info;
+    try {
+      info = await networkRetry(
+        () => smtpSend(account, mailOptions),
+        2, 3000  // 2 retries, 3s backoff — transient network glitches only
+      );
+    } catch (e) {
+      // Auth/credential failure → evict so next attempt creates a fresh session
+      if (/auth|credential|535|534|530|username|password|login/i.test(e.message)) {
+        evictTransporter(account.id);
+      }
+      throw e;
+    }
 
     // Fire-and-forget: save to IMAP Sent (Isolated in its own try/catch boundary)
     const rawMime =[
@@ -1461,7 +1650,8 @@ const mailOptions = {
 // ── Safe migrations
 try { db.exec(`ALTER TABLE email_tracking ADD COLUMN subject TEXT DEFAULT ''`); } catch {}
 try { db.exec(`ALTER TABLE cached_emails ADD COLUMN attachments_json TEXT NOT NULL DEFAULT '[]'`); } catch {}
-try { db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_hist_unique_recipient ON campaign_history(campaign_id, lower(to_email), touch_type)`); } catch {}
+try { db.exec(`DROP INDEX IF EXISTS idx_hist_unique_recipient`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_hist_email_touch ON campaign_history(campaign_id, lower(to_email), touch_type)`); } catch {}
 
 // ── Attachment list for a message (from cached metadata)
 app.get('/api/accounts/:accountId/messages/:uid/attachments', (req,res)=>{
@@ -1529,6 +1719,7 @@ app.get('/api/campaigns/:id', (req, res) => {
     senderIds:safeJson(r.sender_ids,[]), batchSize:r.batch_size,
     batchDelayMin:r.batch_delay_min, batchDelayMax:r.batch_delay_max,
     status:r.status,
+    skipListText: r.skip_list || '', // <-- FIXED: Loads from DB
   });
 });
 
@@ -1543,9 +1734,6 @@ app.put('/api/campaigns/:id', (req, res) => {
   const ex = stmts.getCampaign.get(req.params.id);
   
   if (!ex) {
-    // UPSERT FIX: If the frontend has the campaign in LocalStorage but the backend lost it 
-    // (e.g. DB reset, container restart), seamlessly recreate it instead of throwing 404
-    // which previously caused an infinite retry loop and Foreign Key Constraint failures!
     try {
       stmts.insertCampaign.run(
         req.params.id,
@@ -1563,10 +1751,21 @@ app.put('/api/campaigns/:id', (req, res) => {
         b.batchDelayMax || 35,
         b.status || 'draft'
       );
+
+      // FIXED: Ensure the exclude list is also restored during recreation
+      if (b.skipListText !== undefined) {
+        db.prepare(`UPDATE campaigns SET skip_list=? WHERE id=?`).run(b.skipListText, req.params.id);
+      }
+
       return res.json({ ok: true, restored: true });
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
+  }
+
+  // FIXED: Save the exclude list to the database instantly for normal updates
+  if (b.skipListText !== undefined) {
+    try { db.prepare(`UPDATE campaigns SET skip_list=? WHERE id=?`).run(b.skipListText, req.params.id); } catch {}
   }
 
   const name      = b.name      !== undefined ? b.name      : ex.name;
@@ -1579,6 +1778,7 @@ app.put('/api/campaigns/:id', (req, res) => {
   const batchSize = b.batchSize !== undefined ? b.batchSize : ex.batch_size;
   const batchDMin = b.batchDelayMin !== undefined ? b.batchDelayMin : ex.batch_delay_min;
   const batchDMax = b.batchDelayMax !== undefined ? b.batchDelayMax : ex.batch_delay_max;
+  
   let csvHeaders = ex.csv_headers;
   let csvRows    = ex.csv_rows;
   if (b.csvHeaders !== undefined) {
@@ -1595,19 +1795,40 @@ app.put('/api/campaigns/:id', (req, res) => {
     if (inc.length > 0 || b.clearSenders === true) senderIds = JSON.stringify(inc);
   }
   
+  const onlyMeta = b.csvHeaders === undefined && b.csvRows === undefined &&
+                   b.pitch === undefined && b.fuPitch === undefined &&
+                   b.subject === undefined && b.fuSubject === undefined;
+                   
+  if (onlyMeta) {
+    const sets = [], vals = [];
+    if (b.name      !== undefined) { sets.push('name=?');       vals.push(name); }
+    if (b.status    !== undefined) { sets.push('status=?');     vals.push(status); }
+    if (b.senderIds !== undefined) { sets.push('sender_ids=?'); vals.push(senderIds); }
+    if (b.emailCol  !== undefined) { sets.push('email_col=?');  vals.push(emailCol); }
+    if (b.batchSize !== undefined) { sets.push('batch_size=?'); vals.push(batchSize); }
+    if (b.fuSubject !== undefined) { sets.push('fu_subject=?'); vals.push(fuSubject); }
+    if (sets.length) {
+      sets.push("updated_at=datetime('now')");
+      db.prepare(`UPDATE campaigns SET ${sets.join(',')} WHERE id=?`).run(...vals, req.params.id);
+    }
+    return res.json({ ok: true });
+  }
+
   stmts.updateCampaign.run(name, subject, pitch, fuPitch, fuSubject,
     emailCol, csvHeaders, csvRows, senderIds,
     batchSize, batchDMin, batchDMax, status, req.params.id);
-    
   res.json({ ok: true });
 });
 
 app.delete('/api/campaigns/:id', (req, res) => {
   try {
-    db.prepare(`DELETE FROM campaign_history WHERE campaign_id=?`).run(req.params.id);
-    db.prepare(`DELETE FROM sent_rows WHERE campaign_id=?`).run(req.params.id);
-    db.prepare(`DELETE FROM email_tracking WHERE campaign_id=?`).run(req.params.id);
-    db.prepare(`DELETE FROM campaigns WHERE id=?`).run(req.params.id);
+    const del = db.transaction(() => {
+      db.prepare(`DELETE FROM email_tracking   WHERE campaign_id=?`).run(req.params.id);
+      db.prepare(`DELETE FROM sent_rows        WHERE campaign_id=?`).run(req.params.id);
+      db.prepare(`DELETE FROM campaign_history WHERE campaign_id=?`).run(req.params.id);
+      db.prepare(`DELETE FROM campaigns        WHERE id=?`).run(req.params.id);
+    });
+    del();
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1623,7 +1844,7 @@ app.delete('/api/campaigns/:id/csv', (req, res) => {
 });
 
 app.get('/api/campaigns/:id/history', (req, res) => {
-  const limit  = Math.min(10000, parseInt(req.query.limit  || '10000', 10));
+  const limit  = Math.min(50000, parseInt(req.query.limit  || '50000', 10));
   const offset = Math.max(0,     parseInt(req.query.offset || '0',     10));
   const rows = db.prepare(`
     SELECT id, row_idx, sent_at, sender_email, sender_name,
@@ -1644,31 +1865,36 @@ app.post('/api/campaigns/:id/history', (req, res) => {
   if (!b.toEmail || !b.sentAt) return res.status(400).json({ error: 'toEmail and sentAt required' });
   const sentAtNorm = b.sentAt.replace(/\.\d+Z$/, 'Z').replace(/\.\d+$/, '');
 
+  // Respond immediately — client doesn't need to wait for DB write
+  // We still do the write synchronously (SQLite is fast for single inserts)
   try {
-    const performSave = db.transaction(() => {
-      if (b.trackId) {
-        const trkDup = db.prepare(
-          `SELECT id FROM campaign_history WHERE campaign_id=? AND track_id=? LIMIT 1`
-        ).get(req.params.id, b.trackId);
-        if (trkDup) return { duplicate: true };
-      }
-      const existing = db.prepare(`
-        SELECT id FROM campaign_history
-        WHERE campaign_id=? AND lower(to_email)=lower(?) AND touch_type=?
-        LIMIT 1
-      `).get(req.params.id, b.toEmail, b.touchType || 'first');
-
-      if (existing) return { duplicate: true };
+    const result = db.transaction(() => {
+  // Only dedup by trackId (unique per send attempt). 
+  // Do NOT dedup by email+touchType — followups are separate touch_type anyway
+  if (b.trackId) {
+    const trkDup = db.prepare(
+      `SELECT id FROM campaign_history WHERE campaign_id=? AND track_id=? LIMIT 1`
+    ).get(req.params.id, b.trackId);
+    if (trkDup) return { duplicate: true };
+  }
+  // Dedup by email+touchType only if no trackId provided (legacy fallback)
+  if (!b.trackId) {
+    const existing = db.prepare(`
+      SELECT id FROM campaign_history
+      WHERE campaign_id=? AND lower(to_email)=lower(?) AND touch_type=?
+      LIMIT 1
+    `).get(req.params.id, b.toEmail, b.touchType || 'first');
+    if (existing) return { duplicate: true };
+  }
 
       stmts.insertHistory.run(
         req.params.id, b.rowIdx, sentAtNorm,
         b.senderEmail, b.senderName || '', b.toEmail, b.subject || '',
-        (b.bodyHTML || '').slice(0, 100000),
-        JSON.stringify(b.rowData || []), b.touchType || 'first', 
+        (b.bodyHTML || '').slice(0, 50000), // cap at 50KB not 100KB for speed
+        JSON.stringify(b.rowData || []), b.touchType || 'first',
         b.trackId || ''
       );
 
-      // 3. Insert Tracking Record in the exact same transaction
       if (b.trackId) {
         db.prepare(`
           INSERT OR IGNORE INTO email_tracking(id,campaign_id,to_email,sender_email,subject,touch_type,sent_at)
@@ -1676,75 +1902,64 @@ app.post('/api/campaigns/:id/history', (req, res) => {
         `).run(b.trackId, req.params.id, b.toEmail, b.senderEmail, b.subject || '', b.touchType || 'first', sentAtNorm);
       }
 
-      // 4. Global Pairs
       if (b.senderEmail && b.toEmail) {
         stmts.insertPair.run(b.senderEmail.toLowerCase(), b.toEmail.toLowerCase());
       }
 
       return { duplicate: false };
-    }); // <-- Closes the db.transaction block
+    })();
 
-    // Execute the transaction
-    const result = performSave();
+    if (result.duplicate) return res.status(200).json({ ok: true, duplicate: true });
 
-    if (result.duplicate) {
-      // #region agent log
-      fetch('http://127.0.0.1:7637/ingest/31a40364-5d72-4efd-affa-1ca1d1d2bcee',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0d63d2'},body:JSON.stringify({sessionId:'0d63d2',hypothesisId:'H5',location:'server.js:POST history',message:'duplicate skipped',data:{campId:req.params.id,hasTrack:!!b.trackId,rowIdx:b.rowIdx},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
-      return res.status(200).json({ ok: true, duplicate: true });
-    }
-
-    // #region agent log
-    fetch('http://127.0.0.1:7637/ingest/31a40364-5d72-4efd-affa-1ca1d1d2bcee',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'0d63d2'},body:JSON.stringify({sessionId:'0d63d2',hypothesisId:'H5',location:'server.js:POST history',message:'inserted',data:{campId:req.params.id,hasTrack:!!b.trackId,rowIdx:b.rowIdx},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
-    autoContact(b.toEmail, '');
+    // Auto-contact in background (fire-and-forget)
+    setImmediate(() => autoContact(b.toEmail, ''));
     res.status(201).json({ ok: true });
 
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-}); // <-- Closes the app.post route
-
-// ── Scan inboxes for tracking signals (call after campaign, or on History tab open)
-app.post('/api/campaigns/:id/scan-tracking', async (req, res) => {
-  const campId = req.params.id;
-  try {
-    // Load all tracking records for this campaign
-    const rows = db.prepare('SELECT * FROM email_tracking WHERE campaign_id=?').all(campId);
-    if (!rows.length) return res.json({ scanned: 0, found: 0 });
-
-    // Build map: trackId -> { toEmail, subject }
-    const trackingMap = {};
-    rows.forEach(r => { trackingMap[r.id] = { toEmail: r.to_email, subject: r.subject || '', trackId: r.id }; });
-
-    // Group by sender account
-    const bySender = {};
-    rows.forEach(r => {
-      if (!bySender[r.sender_email]) bySender[r.sender_email] = {};
-      bySender[r.sender_email][r.id] = trackingMap[r.id];
-    });
-
-    let totalFound = 0;
-    const senderEmails = Object.keys(bySender);
-
-    await Promise.all(senderEmails.map(async senderEmail => {
-      // Find account by email
-      const account = db.prepare('SELECT * FROM accounts WHERE lower(email)=lower(?)').get(senderEmail);
-      if (!account) return;
-      try {
-        const results = await scanInboxForTracking(account, campId, bySender[senderEmail]);
-        if (results.length > 0) {
-          applyTrackingResults(results);
-          totalFound += results.length;
-        }
-      } catch {}
-    }));
-
-    res.json({ scanned: senderEmails.length, found: totalFound });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
 });
+
+// ── Batch history save — ONE call saves up to 200 entries atomically ──────
+// Prevents SQLite overload from 5000 individual concurrent POST requests
+app.post('/api/campaigns/:id/history/batch', (req, res) => {
+  const entries = req.body?.entries;
+  if (!Array.isArray(entries) || !entries.length) return res.json({ ok: true, saved: 0 });
+  let saved = 0, dupes = 0;
+  try {
+    db.transaction(() => {
+      for (const b of entries) {
+        if (!b.toEmail || !b.sentAt) continue;
+        const sat = String(b.sentAt).replace(/\.\d+Z$/, 'Z').replace(/\.\d+$/, '');
+
+        // Dedup by trackId
+        if (b.trackId) {
+          const dup = db.prepare(`SELECT id FROM campaign_history WHERE campaign_id=? AND track_id=? LIMIT 1`).get(req.params.id, b.trackId);
+          if (dup) { dupes++; continue; }
+        }
+
+        stmts.insertHistory.run(
+          req.params.id, b.rowIdx ?? 0, sat,
+          b.senderEmail || '', b.senderName || '', b.toEmail,
+          b.subject || '', (b.bodyHTML || '').slice(0, 50000),
+          JSON.stringify(b.rowData || []), b.touchType || 'first', b.trackId || ''
+        );
+
+        if (b.trackId) {
+          db.prepare(`INSERT OR IGNORE INTO email_tracking(id,campaign_id,to_email,sender_email,subject,touch_type,sent_at) VALUES(?,?,?,?,?,?,?)`)
+            .run(b.trackId, req.params.id, b.toEmail, b.senderEmail || '', b.subject || '', b.touchType || 'first', sat);
+        }
+
+        if (b.senderEmail && b.toEmail) {
+          stmts.insertPair.run(b.senderEmail.toLowerCase(), b.toEmail.toLowerCase());
+        }
+        saved++;
+      }
+    })();
+    res.json({ ok: true, saved, dupes });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ══════════════════════════════════════════════════════════════════
 // ENTERPRISE TRACKING ENGINE
@@ -2080,6 +2295,884 @@ function autoContact(email, name='') {
       name=CASE WHEN name='' AND excluded.name!='' THEN excluded.name ELSE name END`).run(makeId(),em,name||'');
   } catch {}
 }
+
+// ═══════════════════════════════════════════════════════════════
+// SERVER-SIDE CAMPAIGN EXECUTION ENGINE
+// One HTTP call to launch. Server manages delays, SMTP pool, queue.
+// Outlook-style: each sender has its own persistent authenticated session.
+// Progress pushed to all SSE clients every 400ms.
+// ═══════════════════════════════════════════════════════════════
+const _campEngines = new Map(); // campId → engine state
+
+const SMTP_BLOCK_SET = new Set(['Daily Limit','Browser Login','Auth Failed','Invalid Creds','Rate Limited']);
+
+function classifySMTPError(msg) {
+  const s = String(msg || '');
+  if (/5\.4\.5|daily.*limit/i.test(s))  return 'Daily Limit';
+  if (/auth.*fail|5\.5\.1/i.test(s))    return 'Auth Failed';
+  if (/web browser/i.test(s))           return 'Browser Login';
+  if (/invalid.*cred/i.test(s))         return 'Invalid Creds';
+  if (/rate.*limit/i.test(s))           return 'Rate Limited';
+  return s.length > 72 ? s.slice(0, 72) + '…' : s;
+}
+
+function sleepMs(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function pushCampProg(campId) {
+  const e = _campEngines.get(campId);
+  if (!e) return;
+  // Drain accumulated history entries since last 400ms push
+  const newHistEntries = e.histBatch ? e.histBatch.splice(0) : [];
+  ssePush('camp_progress', {
+    campId,
+    type:            e.type,
+    status:          e.status,
+    sent:            e.sent,
+    total:           e.total,
+    errors:          e.errors.slice(0, 20),
+    logEntries:      [...e.logMap.values()], // ALL entries: waiting + sending + error
+    newHistEntries,                          // real-time history for client
+  });
+}
+
+async function campDelayLoop(ms, eng, logKey) {
+  if (!eng) return false;
+  let end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (eng.abort) return false;
+    while (eng.pause && !eng.abort) {
+      await sleepMs(200);
+      end += 200;
+      const log = eng.logMap.get(logKey);
+      if (log) eng.logMap.set(logKey, { ...log, wakeTime: end });
+    }
+    if (eng.abort) return false;
+    const remain = end - Date.now();
+    if (remain > 0) await sleepMs(Math.min(250, remain));
+  }
+  return true;
+}
+
+// Server-side {{placeholder}} resolver (no DOM needed)
+function serverResolve(template, headers, rowArr) {
+  if (!template) return '';
+  return template.replace(/\{\{([^}]+)\}\}/g, (match, key) => {
+    const k = key.trim().toLowerCase();
+    const idx = (headers || []).findIndex(h => (h || '').trim().toLowerCase() === k);
+    // Unknown placeholder (e.g. {{Account Signature}}) → preserve as-is for serverInjectSig
+    return idx >= 0 ? ((rowArr || [])[idx] || '') : match;
+  });
+}
+
+// Outlook-safe signature normalizer:
+// Outlook's Word renderer does NOT inherit font-family/size/color from parent
+// elements the way browsers do. Every single element needs it explicitly set.
+// This reads the dominant styles from the signature and stamps them on every
+// child element that doesn't already declare them.
+function outlookNormalizeSig(html) {
+  if (!html) return '';
+
+  // Extract dominant font properties from ALL occurrences, picking the most specific
+  const allFontFamilies = [...html.matchAll(/font-family\s*:\s*([^;!'"<>\n]+)/gi)].map(m => m[1].trim());
+  const allFontSizes    = [...html.matchAll(/font-size\s*:\s*([^;!'"<>\n]+)/gi)].map(m => m[1].trim());
+  const allColors       = [...html.matchAll(/(?<![a-z-])color\s*:\s*([^;!'"<>\n]+)/gi)].map(m => m[1].trim());
+  const allWeights      = [...html.matchAll(/font-weight\s*:\s*([^;!'"<>\n]+)/gi)].map(m => m[1].trim());
+  const allStyles       = [...html.matchAll(/font-style\s*:\s*([^;!'"<>\n]+)/gi)].map(m => m[1].trim());
+
+  const domFont   = allFontFamilies[0] || '';
+  const domSize   = allFontSizes[0]    || '';
+  const domColor  = allColors[0]       || '';
+  const domWeight = allWeights[0]      || '';
+  const domStyle  = allStyles[0]       || '';
+
+  const VOIDS = new Set(['br','hr','img','input','meta','link','area','base','col','embed','param','source','track','wbr']);
+
+  // Step 1: Convert <font> tags to inline-styled <span> — Outlook ignores <font> entirely
+  let out = html;
+  out = out.replace(/<font([^>]*)>/gi, (_, attrs) => {
+    let style = '';
+    const faceM  = attrs.match(/\bface=["']?([^"'\s>]+(?:\s[^"'\s>]+)*)["']?/i);
+    const sizeM  = attrs.match(/\bsize=["']?(\d+)["']?/i);
+    const colorM = attrs.match(/\bcolor=["']?([^"'\s>]+)["']?/i);
+    const styleM = attrs.match(/\bstyle=["']([^"']*)["']/i);
+    if (faceM)  style += `font-family:${faceM[1].replace(/['"]/g,'').trim()};`;
+    if (sizeM)  {
+      const px = ['10px','13px','16px','18px','24px','32px','48px'];
+      style += `font-size:${px[Math.min(parseInt(sizeM[1])-1, 6)] || '14px'};`;
+    }
+    if (colorM) style += `color:${colorM[1]};`;
+    if (styleM) style += styleM[1].replace(/;+$/,'') + ';';
+    return `<span style="${style}">`;
+  });
+  out = out.replace(/<\/font>/gi, '</span>');
+
+  // Step 2: text-decoration:underline in CSS → <u> tag (Outlook strips CSS underline)
+  // Must do this BEFORE stamping styles so we don't re-add text-decoration
+  out = out.replace(
+    /(<(?!\/)[a-z][a-z0-9]*(?:\s[^>]*)?\sstyle="[^"]*?text-decoration\s*:\s*underline[^"]*?"[^>]*>)([\s\S]*?)(<\/[a-z][a-z0-9]*>)/gi,
+    (match, openTag, content, closeTag) => {
+      const cleanTag = openTag.replace(/text-decoration\s*:\s*underline\s*;?/gi, '')
+                               .replace(/text-decoration-line\s*:\s*underline\s*;?/gi, '');
+      return `<u>${cleanTag}${content}${closeTag}</u>`;
+    }
+  );
+
+  if (!domFont && !domSize && !domColor) return out;
+
+  const stamp = (existing) => {
+    let s = (existing || '').replace(/;\s*$/, '').trim();
+    // Only inject if not already explicitly set on THIS element
+    if (domFont   && !/font-family\s*:/i.test(s))
+      s = `font-family:${domFont};mso-ansi-font-family:${domFont};${s}`;
+    if (domSize   && !/font-size\s*:/i.test(s))
+      s = `font-size:${domSize};mso-ansi-font-size:${domSize};${s}`;
+    if (domColor  && !/(?<![a-z-])color\s*:/i.test(s))
+      s = `color:${domColor};${s}`;
+    if (domWeight && !/font-weight\s*:/i.test(s))
+      s = `font-weight:${domWeight};${s}`;
+    if (domStyle  && !/font-style\s*:/i.test(s))
+      s = `font-style:${domStyle};${s}`;
+    return s.replace(/;\s*$/, '');
+  };
+
+  // Step 3: Stamp onto existing style attributes
+  out = out.replace(/(<[a-z][^>]*)\sstyle="([^"]*)"/gi, (_, tagStart, existing) => {
+    return `${tagStart} style="${stamp(existing)}"`;
+  });
+
+  // Step 4: Add style to elements with NO style attribute at all
+  out = out.replace(/<([a-z][a-z0-9]*)(\s[^>]*)?>/gi, (match, tag, attrs) => {
+    if (VOIDS.has(tag.toLowerCase())) return match;
+    if ((attrs || '').match(/\bstyle\s*=/i)) return match;
+    const s = stamp('');
+    return s ? `<${tag}${attrs || ''} style="${s}">` : match;
+  });
+
+  return out;
+}
+
+function serverInjectSig(html, sigHtml) {
+  if (!html) return '';
+  const PLACEHOLDER_RE = /\{\{(?:[\s\u00A0]|&nbsp;)*Account(?:[\s\u00A0]|&nbsp;)+Signature(?:[\s\u00A0]|&nbsp;)*\}\}/gi;
+  if (!PLACEHOLDER_RE.test(html)) return html;
+  PLACEHOLDER_RE.lastIndex = 0;
+  // Normalize first so every child element has explicit font-family/size/color
+  // — Outlook's Word renderer doesn't inherit CSS from parent elements.
+  // Normalize first so every child element has explicit font-family/size/color
+  // — Outlook's Word renderer doesn't inherit CSS from parent elements.
+  const base = outlookNormalizeSig(sigHtml || '');
+  return html.replace(PLACEHOLDER_RE, () => {
+    if (!base) return '';
+    const ov = _extractSigOverrides(html);
+    return Object.keys(ov).length ? _applySigOverrides(base, ov) : base;
+  });
+}
+
+// Parses only INLINE wrapper tags around {{Account Signature}} — block elements
+// (div/p/td) reflect pitch layout, not the user's intentional override.
+function _extractSigOverrides(html) {
+  const ov = {};
+  const match = html.match(/\{\{(?:[\s\u00A0]|&nbsp;)*Account(?:[\s\u00A0]|&nbsp;)+Signature(?:[\s\u00A0]|&nbsp;)*\}\}/i);
+  if (!match) return ov;
+
+  const before = html.slice(0, match.index);
+
+  const INLINE = new Set(['span','b','strong','i','em','u','s','strike','font','sub','sup','mark','small','big','tt','code','abbr','cite','q','var','kbd','samp']);
+  const RELEVANT = ['font-size','font-family','color','background-color','font-weight','font-style','text-decoration'];
+
+  const tagRe = /<(\/?[a-z][a-z0-9]*)(\s(?:[^"'>]|"[^"]*"|'[^']*')*)?>/gi;
+  const stack = [];
+  let m;
+
+  while ((m = tagRe.exec(before)) !== null) {
+    const raw   = m[1] || '';
+    const attrs = m[2] || '';
+    const isClose = raw.startsWith('/');
+    const tag = isClose ? raw.slice(1).toLowerCase() : raw.toLowerCase();
+    if (!INLINE.has(tag)) continue;
+
+    if (isClose) {
+      for (let i = stack.length - 1; i >= 0; i--) {
+        if (stack[i].tag === tag) { stack.splice(i, 1); break; }
+      }
+    } else {
+      const node = { tag, style: {} };
+
+      // Semantic tags
+      if (tag === 'b' || tag === 'strong') node.style['font-weight'] = 'bold';
+      if (tag === 'i' || tag === 'em')     node.style['font-style']  = 'italic';
+      if (tag === 'u')                     node.style['text-decoration'] = 'underline';
+      if (tag === 's' || tag === 'strike') node.style['text-decoration'] = 'line-through';
+
+      // Parse style="" — innermost element wins so process fully
+      const sm = attrs.match(/\bstyle=["']([^"']*)["']/i);
+      if (sm) {
+        sm[1].split(';').forEach(part => {
+          const ci = part.indexOf(':');
+          if (ci < 1) return;
+          const k = part.slice(0, ci).trim().toLowerCase();
+          const v = part.slice(ci + 1).trim().replace(/\s*!important\s*/gi, '').trim();
+          if (k && v && RELEVANT.includes(k)) node.style[k] = v;
+        });
+      }
+
+      // Legacy <font> attributes
+      if (tag === 'font') {
+        const colorM = attrs.match(/\bcolor=["']?([^"'\s>]+)["']?/i);
+        const faceM  = attrs.match(/\bface=["']([^"']*)["']/i);
+        const sizeM  = attrs.match(/\bsize=["']?(\d+)["']?/i);
+        if (colorM) node.style['color']       = colorM[1];
+        if (faceM)  node.style['font-family'] = faceM[1].replace(/['"]/g, '').trim();
+        if (sizeM)  {
+          const px = ['10px','13px','16px','18px','24px','32px','48px'];
+          node.style['font-size'] = px[Math.min(parseInt(sizeM[1]) - 1, 6)] || '14px';
+        }
+      }
+      stack.push(node);
+    }
+  }
+
+  // Collapse: innermost wins (last in stack = innermost wrapper)
+  // Iterate from innermost outward — first value found wins
+  for (let i = stack.length - 1; i >= 0; i--) {
+    RELEVANT.forEach(k => {
+      if (stack[i].style[k] && !ov[k]) ov[k] = stack[i].style[k];
+    });
+  }
+
+  return ov;
+}
+
+// Applies style overrides to every element inside the signature HTML
+function _applySigOverrides(sigHtml, ov) {
+  if (!sigHtml || !Object.keys(ov).length) return sigHtml;
+
+  const VOIDS = new Set(['br','hr','img','input','meta','link','area','base','col','embed','param','source','track','wbr']);
+
+  // Build override style string — use !important to beat existing inline styles
+  const ovStr = Object.entries(ov)
+    .filter(([, v]) => v)
+    .map(([k, v]) => `${k}:${v}!important`)
+    .join(';');
+
+  let out = sigHtml;
+
+  // Step 1: Convert <font> to <span> first so we can target style attributes uniformly
+  out = out.replace(/<font([^>]*)>/gi, (_, attrs) => {
+    let style = '';
+    const faceM  = attrs.match(/\bface=["']?([^"'\s>]+)["']?/i);
+    const sizeM  = attrs.match(/\bsize=["']?(\d+)["']?/i);
+    const colorM = attrs.match(/\bcolor=["']?([^"'\s>]+)["']?/i);
+    const styleM = attrs.match(/\bstyle=["']([^"']*)["']/i);
+    if (faceM)  style += `font-family:${faceM[1].replace(/['"]/g,'').trim()};`;
+    if (sizeM)  { const px=['10px','13px','16px','18px','24px','32px','48px']; style += `font-size:${px[Math.min(parseInt(sizeM[1])-1,6)]||'14px'};`; }
+    if (colorM) style += `color:${colorM[1]};`;
+    if (styleM) style += styleM[1];
+    return `<span style="${style}">`;
+  });
+  out = out.replace(/<\/font>/gi, '</span>');
+
+  // Step 2: Strip conflicting properties from ALL existing style attributes
+  const stripProps = (styleStr) => {
+    let s = styleStr;
+    if (ov['font-size'])        s = s.replace(/font-size\s*:[^;]*(;|$)/gi, '');
+    if (ov['font-family'])      s = s.replace(/font-family\s*:[^;]*(;|$)/gi, '');
+    if (ov['color'])            s = s.replace(/(?<![a-z-])color\s*:[^;]*(;|$)/gi, '');
+    if (ov['background-color']) s = s.replace(/background-color\s*:[^;]*(;|$)/gi, '');
+    if (ov['font-weight'])      s = s.replace(/font-weight\s*:[^;]*(;|$)/gi, '');
+    if (ov['font-style'])       s = s.replace(/font-style\s*:[^;]*(;|$)/gi, '');
+    if (ov['text-decoration'])  s = s.replace(/text-decoration[^;]*(;|$)/gi, '');
+    return s.replace(/;+/g, ';').replace(/^;|;$/g, '').trim();
+  };
+
+  // Step 3: Handle <u> tags — if override removes underline, unwrap them
+  if (ov['text-decoration'] && !ov['text-decoration'].includes('underline')) {
+    out = out.replace(/<u>([\s\S]*?)<\/u>/gi, '$1');
+  }
+
+  // Step 4: Inject overrides into existing style attributes
+  out = out.replace(/(<[a-z][^>]*)\sstyle="([^"]*)"/gi, (_, tagStart, existing) => {
+    const cleaned = stripProps(existing);
+    return `${tagStart} style="${cleaned ? cleaned + ';' : ''}${ovStr}"`;
+  });
+
+  // Step 5: Add style to elements with NO style attribute
+  out = out.replace(/<([a-z][a-z0-9]*)(\s[^>]*)?>/gi, (match, tag, attrs) => {
+    if (VOIDS.has(tag.toLowerCase())) return match;
+    if ((attrs || '').match(/\bstyle\s*=/i)) return match;
+    return `<${tag}${attrs || ''} style="${ovStr}">`;
+  });
+
+  // Step 6: If override includes underline, wrap text nodes in <u>
+  // (re-apply after style injection since we stripped text-decoration above)
+  if (ov['text-decoration'] && ov['text-decoration'].includes('underline')) {
+    // Already handled via !important in style — also add <u> for Outlook
+    out = out.replace(
+      /(<(?!u\b)[a-z][a-z0-9]*(?:\s[^>]*)?\sstyle="[^"]*text-decoration[^"]*underline[^"]*"[^>]*>)([\s\S]*?)(<\/[a-z][a-z0-9]*>)/gi,
+      (match, open, content, close) => `<u>${open}${content}${close}</u>`
+    );
+  }
+
+  return out;
+}
+
+// Extract inline CSS styles from tags wrapping {{Account Signature}} in the pitch HTML
+function extractWrappingStyles(html) {
+  const ov = {};
+  // Find the placeholder with surrounding tag context (up to 2000 chars before)
+  const phMatch = html.match(/([\s\S]{0,2000})\{\{(?:&nbsp;|\s)*Account(?:&nbsp;|\s)+Signature(?:&nbsp;|\s)*\}\}/i);
+  if (!phMatch) return ov;
+
+  const before = phMatch[1];
+
+  // Extract style="" attributes from all open tags in the preceding context
+  const styleMatches = [...before.matchAll(/<[a-z][^>]*\sstyle="([^"]+)"[^>]*>/gi)];
+  styleMatches.forEach(m => {
+    const styleStr = m[1];
+    extractStyleProps(styleStr, ov);
+  });
+
+  // Check for semantic bold/italic/underline tags
+  if (/<b(?:\s[^>]*)?>(?:(?!<\/b>)[\s\S]){0,2000}$/i.test(before) ||
+      /<strong(?:\s[^>]*)?>(?:(?!<\/strong>)[\s\S]){0,2000}$/i.test(before)) {
+    if (!ov['font-weight']) ov['font-weight'] = 'bold';
+  }
+  if (/<i(?:\s[^>]*)?>(?:(?!<\/i>)[\s\S]){0,2000}$/i.test(before) ||
+      /<em(?:\s[^>]*)?>(?:(?!<\/em>)[\s\S]){0,2000}$/i.test(before)) {
+    if (!ov['font-style']) ov['font-style'] = 'italic';
+  }
+  if (/<u(?:\s[^>]*)?>(?:(?!<\/u>)[\s\S]){0,2000}$/i.test(before)) {
+    if (!ov['text-decoration']) ov['text-decoration'] = 'underline';
+  }
+
+  // Check for <font> tags (legacy execCommand output)
+  const fontTags = [...before.matchAll(/<font([^>]*)>/gi)];
+  fontTags.forEach(ft => {
+    const attrs = ft[1];
+    const colorM = attrs.match(/color=["']?([^"'\s>]+)/i);
+    const faceM  = attrs.match(/face=["']?([^"'>]+)/i);
+    if (colorM && !ov['color']) ov['color'] = colorM[1];
+    if (faceM  && !ov['font-family']) ov['font-family'] = faceM[1].replace(/['"]/g, '').trim();
+    // Extract style inside font tag too
+    const styleM = attrs.match(/style=["']([^"']+)/i);
+    if (styleM) extractStyleProps(styleM[1], ov);
+  });
+
+  return ov;
+}
+
+// Parse a CSS style string and populate an overrides object
+function extractStyleProps(styleStr, ov) {
+  const props = styleStr.split(';').map(s => s.trim()).filter(Boolean);
+  props.forEach(prop => {
+    const ci = prop.indexOf(':');
+    if (ci < 0) return;
+    const key = prop.slice(0, ci).trim().toLowerCase();
+    const val = prop.slice(ci + 1).trim().replace(/\s*!important\s*$/i, '');
+    if (!val) return;
+    if (key === 'font-size'        && !ov['font-size'])        ov['font-size']        = val;
+    if (key === 'font-family'      && !ov['font-family'])      ov['font-family']      = val;
+    if (key === 'color'            && !ov['color'])            ov['color']            = val;
+    if (key === 'background-color' && !ov['background-color']) ov['background-color'] = val;
+    if (key === 'font-weight'      && !ov['font-weight'])      ov['font-weight']      = val;
+    if (key === 'font-style'       && !ov['font-style'])       ov['font-style']       = val;
+    if (key === 'text-decoration'  && !ov['text-decoration'])  ov['text-decoration']  = val;
+  });
+}
+
+// Apply style overrides to every element in the signature HTML string (no DOM — regex-based)
+function applyStylesToSigHtml(sigHtml, ov) {
+  if (!sigHtml || !ov || Object.keys(ov).length === 0) return sigHtml;
+
+  // Build the override style string
+  const overrideStr = Object.entries(ov).map(([k, v]) => `${k}:${v}!important`).join(';');
+
+  // Remove conflicting properties from existing inline styles on all elements
+  let result = sigHtml;
+
+  // Strip existing font-size and font-family from all style="" attributes and <font> attrs
+  if (ov['font-size']) {
+    result = result.replace(/(\sstyle="[^"]*?)font-size\s*:[^;"]*(;?)/gi, '$1$2');
+    result = result.replace(/<font([^>]*)\ssize=["']?\d+["']?/gi, '<font$1');
+  }
+  if (ov['font-family']) {
+    result = result.replace(/(\sstyle="[^"]*?)font-family\s*:[^;"]*(;?)/gi, '$1$2');
+    result = result.replace(/<font([^>]*)\sface=["'][^"']*["']/gi, '<font$1');
+  }
+
+  // Inject overrides into every existing style="" attribute
+  result = result.replace(/(<[a-z][^>]*)\sstyle="([^"]*)"/gi, (_, tagStart, existingStyle) => {
+    const cleaned = existingStyle.replace(/\s*;\s*$/, '').trim();
+    const combined = cleaned ? `${cleaned};${overrideStr}` : overrideStr;
+    return `${tagStart} style="${combined}"`;
+  });
+
+  // For elements with NO style attribute, add one
+  result = result.replace(/<([a-z][a-z0-9]*)(\s[^>]*)?>/gi, (match, tag, attrs) => {
+    // Skip void elements and already-processed elements
+    const voids = new Set(['br','hr','img','input','meta','link','area','base','col','embed','param','source','track','wbr']);
+    if (voids.has(tag.toLowerCase())) return match;
+    if ((attrs || '').includes('style="')) return match; // already has style — handled above
+    return `<${tag}${attrs || ''} style="${overrideStr}">`;
+  });
+
+  return result;
+}
+
+// Server-side Outlook-safe HTML normalization (no browser DOM needed)
+function serverNormalizeHtml(html) {
+  if (!html) return '';
+  // <p> → <div>
+  html = html.replace(/<p(\s[^>]*)?\s*>/gi, (_, a) =>
+    `<div${a || ''} style="margin:0;padding:0;line-height:1.65">`);
+  html = html.replace(/<\/p>/gi, '</div>');
+
+  // Lists
+  html = html.replace(/<ul([^>]*)>/gi,
+    '<ul$1 style="margin:0 0 10px 30px;padding:0;list-style-type:disc;list-style-position:outside">');
+  html = html.replace(/<ol([^>]*)>/gi,
+    '<ol$1 style="margin:0 0 10px 30px;padding:0;list-style-type:decimal;list-style-position:outside">');
+  html = html.replace(/<li([^>]*)>/gi,
+    '<li$1 style="margin:0 0 4px 0;padding:0;display:list-item">');
+
+  // OUTLOOK UNDERLINE FIX: text-decoration:underline CSS → <u> tags
+  // Root cause of old bug: `(\s[^>]*)?` was greedy and consumed the `style=` attribute,
+  // so the regex never matched anything. Fix uses `[^>]*?` (lazy) + `\bstyle=`.
+  // Belt-and-suspenders: keep CSS AND add <u> so ALL clients (Outlook, Gmail, Apple) work.
+  html = html.replace(
+    /<(span|b|strong|i|em|a|font)\b([^>]*?)\bstyle="([^"]*?\btext-decoration\s*:\s*underline[^"]*?)"([^>]*)>([\s\S]*?)<\/\1>/gi,
+    (_, tag, pre, style, post, content) => {
+      // Strip only text-decoration:underline from the CSS (keep other styles intact)
+      const cleanStyle = style
+        .replace(/\btext-decoration(?:-line)?\s*:\s*underline\s*;?/gi, '')
+        .replace(/;{2,}/g, ';').replace(/^;+|;+$/g, '').trim();
+      const styleAttr = cleanStyle ? ` style="${cleanStyle}"` : '';
+      // Wrap with <u> for Outlook + keep remaining CSS for Gmail/Apple Mail
+      return `<u><${tag}${pre}${styleAttr}${post}>${content}</${tag}></u>`;
+    }
+  );
+
+  // OUTLOOK FONT FIX: convert all <font> tags to inline-styled spans
+  html = html.replace(/<font([^>]*)>/gi, (_, attrs) => {
+    let style = '';
+    const faceM  = attrs.match(/\bface=["']?([^"'\s>]+)["']?/i);
+    const sizeM  = attrs.match(/\bsize=["']?(\d+)["']?/i);
+    const colorM = attrs.match(/\bcolor=["']?([^"'\s>]+)["']?/i);
+    const styleM = attrs.match(/\bstyle=["']([^"']*)["']/i);
+    if (faceM)  style += `font-family:${faceM[1].replace(/['"]/g,'').trim()};`;
+    if (sizeM)  { const px=['10px','13px','16px','18px','24px','32px','48px']; style += `font-size:${px[Math.min(parseInt(sizeM[1])-1,6)]||'14px'};`; }
+    if (colorM) style += `color:${colorM[1]};`;
+    if (styleM) style += styleM[1];
+    return `<span style="${style}">`;
+  });
+  html = html.replace(/<\/font>/gi, '</span>');
+
+  return html;
+}
+
+// Inject tracking pixel and wrap links
+function addTracking(body, trackId) {
+  if (!trackId || !TRACK_OPENS) return body;
+  let out = body;
+  const pixel = `${TRACK_BASE_URL}/track/open/${encodeURIComponent(trackId)}`;
+  out += `<img src="${pixel}" width="1" height="1" border="0" style="display:none;height:1px!important;width:1px!important" alt="" />`;
+  out = out.replace(/<a\s+([^>]*?)href=["']([^"'#][^"']*)["']([^>]*)>/gi, (m, pre, url, post) => {
+    if (url.includes('/track/')) return m;
+    const cu = `${TRACK_BASE_URL}/track/click/${encodeURIComponent(trackId)}?url=${encodeURIComponent(url)}`;
+    return `<a ${pre}href="${cu}"${post}>`;
+  });
+  return out;
+}
+
+// Prepared statements for campaign engine (no LIMIT — engine needs all rows)
+const _stmtSentCheck = db.prepare(`SELECT row_idx, lower(to_email) as em, touch_type FROM campaign_history WHERE campaign_id=?`);
+const _stmtFuHistory = db.prepare(`SELECT row_idx, sent_at, sender_email, sender_name, to_email, subject, body_html, touch_type, row_data, lower(to_email) as em FROM campaign_history WHERE campaign_id=? AND (touch_type='first' OR touch_type IS NULL OR touch_type='') ORDER BY sent_at ASC`);
+const _stmtFuDone    = db.prepare(`SELECT lower(to_email) as em FROM campaign_history WHERE campaign_id=? AND touch_type='followup'`);
+const _stmtSaveTrack = db.prepare(`INSERT OR IGNORE INTO email_tracking(id,campaign_id,to_email,sender_email,subject,touch_type,sent_at) VALUES(?,?,?,?,?,?,?)`);
+
+// Persist one send to DB (atomic transaction)
+function persistSend(campId, entry) {
+  try {
+    db.transaction(() => {
+      stmts.insertHistory.run(
+        campId, entry.rowIdx, entry.sentAt,
+        entry.senderEmail, entry.senderName, entry.toEmail, entry.subject,
+        (entry.bodyHTML || '').slice(0, 50000),
+        JSON.stringify(entry.rowData || []), entry.touchType, entry.trackId || ''
+      );
+      stmts.insertSentRow.run(campId, entry.rowIdx);
+      if (entry.trackId) {
+        _stmtSaveTrack.run(entry.trackId, campId, entry.toEmail, entry.senderEmail, entry.subject, entry.touchType, entry.sentAt);
+      }
+      stmts.insertPair.run((entry.senderEmail || '').toLowerCase(), (entry.toEmail || '').toLowerCase());
+      // Auto-contact
+      db.prepare(`INSERT INTO contacts(id,email,times_contacted,last_seen,source) VALUES(?,?,1,datetime('now'),'auto') ON CONFLICT(email) DO UPDATE SET times_contacted=times_contacted+1, last_seen=datetime('now')`)
+        .run(makeId(), (entry.toEmail || '').toLowerCase());
+    })();
+  } catch (_) { /* history is best-effort — never crash the engine */ }
+}
+
+const AUTO_SAVE_SMTP = new Set(['smtp.gmail.com','smtp.office365.com','smtp.mail.yahoo.com','smtp.mail.me.com','smtpro.zoho.com','smtp.fastmail.com','smtp.aol.com','mail.gmx.com','smtp.yandex.com']);
+
+// Independent sender worker — each sender runs its own async loop
+// Independent sender worker — each sender runs its own async loop
+async function campSenderWorker(campId, sid, queue, payload) {
+  const eng = _campEngines.get(campId);
+  if (!eng) return;
+
+  const account = stmts.getAccount.get(sid);
+  if (!account) return;
+
+  const settings = stmts.getSettings.get(sid) || {};
+  const minD   = Math.max(0, settings.min_delay_sec ?? 180);
+  const maxD   = Math.max(minD, settings.max_delay_sec ?? 540);
+  const sigHtml = payload.signatures?.[sid] || settings.signature_html || '';
+
+  const autoSave = AUTO_SAVE_SMTP.has((account.smtp_host || '').toLowerCase());
+
+  while (queue.length > 0) {
+    if (eng.abort) break;
+    while (eng.pause && !eng.abort) await sleepMs(250);
+    if (eng.abort) break;
+
+    const item = queue.shift();
+    if (!item) break;
+
+    // Random delay
+    const delayMs = minD * 1000 + Math.floor(Math.random() * Math.max(0, maxD - minD + 1)) * 1000;
+    const logKey  = `${item.rowIdx + 1}::${item.toEmail}`;
+
+    eng.logMap.set(logKey, {
+      key: logKey, row: item.rowIdx + 1, email: item.toEmail,
+      fromEmail: account.email, status: 'waiting', wakeTime: Date.now() + delayMs,
+    });
+
+    // Delay loop: pause-aware, abort-aware, accurate wall-clock timing
+    const ok = await campDelayLoop(delayMs, eng, logKey);
+    if (!ok) { queue.unshift(item); break; }
+    if (eng.abort) { queue.unshift(item); break; }
+
+    // Status is 'sending' only when SMTP call is actually in flight
+    eng.logMap.set(logKey, { ...eng.logMap.get(logKey), status: 'sending', wakeTime: undefined });
+
+    try {
+      const delaySec = Math.round(delayMs / 1000);
+      const trackId  = `trk_${campId}_${payload.type === 'fu' ? 'fu_' : ''}${item.rowIdx}_${Date.now().toString(36)}|D${delaySec}`;
+
+      let body = serverInjectSig(
+        serverResolve(payload.pitchTemplate, payload.csvHeaders, item.rowData),
+        sigHtml
+      );
+      // Strip any remaining unresolved placeholders EXCEPT preserve resolved signature
+      body = body.replace(/\{\{(?!Account\s+Signature)[^}]+\}\}/g, '');
+
+      let subject = serverResolve(payload.subjectTemplate, payload.csvHeaders, item.rowData) || payload.subjectTemplate || '';
+
+      // Follow-up logic
+      if (payload.type === 'fu' && item.originalEntry) {
+        const h = item.originalEntry;
+        
+        // ── Auto-generate "RE: First Touch Subject" if user left it blank ──
+        if (!subject.trim()) {
+          const cleanOrig = (h.subject || '').replace(/^(re[:\[]\s*)+/gi, '').trim();
+          subject = cleanOrig ? `RE: ${cleanOrig}` : 'RE: (No Subject)';
+        }
+
+        // Wrap body in reply thread
+        const sd = new Date(h.sentAt || Date.now());
+        const fd = sd.toLocaleDateString('en-US', { weekday:'long', year:'numeric', month:'long', day:'numeric' }) + ' ' + sd.toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:true });
+        body = `<div style="font-family:Calibri,'Helvetica Neue',Arial,sans-serif">${body.trim()}</div><div style="margin:12px 0"><hr style="border:0;border-top:1px solid #e0e0e0"/></div><div style="font-size:12px;color:#444444;line-height:1.7;font-family:Calibri,'Helvetica Neue',Arial,sans-serif"><b style="color:#111111">From:</b> ${h.senderName ? `${h.senderName} &lt;${h.senderEmail}&gt;` : h.senderEmail}<br/><b style="color:#111111">Date:</b> ${fd}<br/><b style="color:#111111">To:</b> ${h.toEmail}<br/><b style="color:#111111">Subject:</b> ${h.subject}</div><div style="margin-top:12px;font-family:Calibri,'Helvetica Neue',Arial,sans-serif">${h.bodyHTML || ''}</div>`;
+      }
+
+      const trackedBody = addTracking(body, trackId);
+
+      // SEND — reuses pooled authenticated TCP connection, zero TLS/AUTH overhead
+      await Promise.race([
+        smtpSend(account, {
+          from: `"${account.name || ''}" <${account.email}>`,
+          to: item.toEmail, subject,
+          html: trackedBody,
+          text: (body || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim(),
+          headers: {
+            'Disposition-Notification-To': account.email,
+            'Return-Receipt-To': account.email,
+            'X-Priority': '3',
+            ...(trackId ? { 'X-MailOS-Track-ID': trackId } : {}),
+          },
+        }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Worker timeout')), 40000))
+      ]);
+
+      // Persist to DB immediately after confirmed send
+      const sentAt = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+      persistSend(campId, {
+        rowIdx: item.rowIdx, sentAt,
+        senderEmail: account.email, senderName: account.name || '',
+        toEmail: item.toEmail, subject, bodyHTML: trackedBody,
+        rowData: item.rowData, touchType: payload.type === 'fu' ? 'followup' : 'first',
+        trackId,
+      });
+
+      // IMAP Sent folder for providers that don't auto-save (fire-and-forget)
+      if (!autoSave) {
+        const rawMime = [`From: "${account.name}" <${account.email}>`, `To: ${item.toEmail}`, `Subject: ${subject}`, `Date: ${new Date().toUTCString()}`, `MIME-Version: 1.0`, `Content-Type: text/html; charset=UTF-8`, ``, body.slice(0, MAX_BODY_BYTES)].join('\r\n');
+        saveToIMAPSent(account, rawMime).catch(() => {});
+      }
+
+      eng.sent++;
+      eng.logMap.delete(logKey);
+
+      // Queue lightweight entry for SSE history push
+      if (eng.histBatch) {
+        eng.histBatch.push({
+          rowIdx:      item.rowIdx,
+          sentAt,
+          senderEmail: account.email,
+          senderName:  account.name || '',
+          toEmail:     item.toEmail,
+          subject,
+          touchType:   payload.type === 'fu' ? 'followup' : 'first',
+          trackId,
+          rowData:     item.rowData || [],
+        });
+      }
+
+    } catch (err) {
+      const et = classifySMTPError(err.message);
+      eng.errors = [{ senderEmail: account.email, toEmail: item.toEmail, reason: et }, ...eng.errors].slice(0, 50);
+      eng.logMap.set(logKey, { ...eng.logMap.get(logKey), status: 'error', reason: et, wakeTime: undefined });
+
+      if (SMTP_BLOCK_SET.has(et)) {
+        evictTransporter(sid);       // auth/limit error: kill this session
+        queue.unshift(item);         // return email to queue for another sender
+        break;                       // this worker exits
+      }
+
+      // Transient network error: retry up to 3 times (push to end of queue)
+      const isTransient = /timeout|econnreset|connection|epipe|etimedout|network/i.test(et);
+      if (isTransient && (item._retries || 0) < 3) {
+        queue.push({ ...item, _retries: (item._retries || 0) + 1 });
+        eng.logMap.delete(logKey);
+      }
+    }
+    // Check abort immediately after each send attempt — prevents one extra email
+    // going out while SMTP was in flight when stop was clicked
+    if (eng.abort) break;
+  }
+}
+
+// Orchestrator: reads CSV from DB, builds queue, spawns sender workers
+async function launchCampaign(campId, payload, eng) {
+  const { type, sIds, subjectTemplate, skipEmails } = payload;
+  let iv;
+  
+  try {
+    const camp = stmts.getCampaign.get(campId);
+    if (!camp) throw new Error('Campaign not found');
+
+    const rawPitch      = type === 'fu' ? (camp.fu_pitch || '') : (camp.pitch || '');
+    const pitchTemplate = serverNormalizeHtml(rawPitch);
+
+    if (!pitchTemplate.replace(/<[^>]+>/g, '').trim()) {
+      throw new Error(type === 'fu' ? 'Follow-up pitch is empty. Save it first.' : 'Pitch is empty. Save your pitch first.');
+    }
+
+    await new Promise(r => setImmediate(r));
+    const csvHeaders = safeJson(camp.csv_headers, []);
+    await new Promise(r => setImmediate(r));
+    const csvRows    = safeJson(camp.csv_rows, []);
+    await new Promise(r => setImmediate(r));
+
+    const ec = camp.email_col >= 0
+      ? camp.email_col
+      : csvHeaders.findIndex(h => /email|mail/i.test(h || ''));
+
+    const doneRows   = new Set(stmts.getSentRows.all(campId).map(r => r.row_idx));
+    const sentEmails = new Set();
+    const sentCheckRows = _stmtSentCheck.all(campId);
+    sentCheckRows
+      .filter(h => h.touch_type === 'first' || !h.touch_type)
+      .forEach(h => { sentEmails.add(h.em); doneRows.add(h.row_idx); });
+
+    const skipSet = new Set((skipEmails || []).map(e => e.toLowerCase()));
+    
+    let singleQueue = []; 
+    let fuQueues = {};    
+    
+    let initialSent = 0;
+    let actualTotal = 0;
+
+    if (type === 'first') {
+      initialSent = doneRows.size;
+      actualTotal = csvRows.length;
+
+      const queued = new Set();
+      for (let ri = 0; ri < csvRows.length; ri++) {
+        if (doneRows.has(ri)) continue;
+        const email = ((csvRows[ri] || [])[ec] || '').trim().toLowerCase();
+        if (!email || sentEmails.has(email) || queued.has(email) || skipSet.has(email)) {
+          doneRows.add(ri); continue;
+        }
+        queued.add(email);
+        singleQueue.push({ rowIdx: ri, toEmail: email, rowData: csvRows[ri] || [] });
+      }
+    } else {
+      const allAccounts = stmts.getAllAccounts.all();
+      const emailToSid = {};
+      allAccounts.forEach(a => emailToSid[a.email.toLowerCase()] = a.id);
+
+      const fuDone = new Set(_stmtFuDone.all(campId).map(h => h.em));
+      const firsts = _stmtFuHistory.all(campId);
+
+      firsts.forEach(h => {
+        const em = h.em;
+        if (!em || skipSet.has(em)) return;
+
+        const sid = emailToSid[(h.sender_email || '').toLowerCase()];
+        if (!sid || !(sIds || []).includes(sid)) return;
+
+        actualTotal++; 
+        
+        if (fuDone.has(em)) {
+          initialSent++;
+        } else {
+          if (!fuQueues[sid]) fuQueues[sid] = [];
+          fuQueues[sid].push({
+            rowIdx: h.row_idx, 
+            toEmail: h.to_email,
+            rowData: safeJson(h.row_data, []),
+            originalEntry: {
+              sentAt: h.sent_at, 
+              senderEmail: h.sender_email,
+              senderName: h.sender_name || '', 
+              toEmail: h.to_email,
+              subject: h.subject || '', 
+              bodyHTML: h.body_html || '',
+            },
+          });
+        }
+      });
+    }
+
+    const remaining = type === 'first' 
+      ? singleQueue.length 
+      : Object.values(fuQueues).reduce((acc, q) => acc + q.length, 0);
+
+    if (remaining === 0) {
+      eng.status = 'done';
+      eng.sent = initialSent;
+      eng.total = actualTotal;
+      return; 
+    }
+
+    eng.status = 'running';
+    eng.sent = initialSent;
+    eng.total = actualTotal;
+
+    iv = setInterval(() => pushCampProg(campId), 400);
+    
+    const wPayload = { type, pitchTemplate, subjectTemplate, csvHeaders, signatures: payload.signatures || {} };
+    
+    await Promise.all((sIds || []).map(sid => {
+      if (type === 'first') {
+        return campSenderWorker(campId, sid, singleQueue, wPayload);
+      } else {
+        const isolatedQueue = fuQueues[sid] || [];
+        return campSenderWorker(campId, sid, isolatedQueue, wPayload);
+      }
+    }));
+
+  } catch (err) {
+    eng.status = 'error';
+    eng.errors.push({ senderEmail: 'System', toEmail: 'N/A', reason: err.message });
+    throw err; 
+  } finally {
+    if (iv) clearInterval(iv);
+    if (eng.status !== 'error') {
+      eng.status = eng.abort ? 'stopped' : 'done';
+    }
+    eng.isFinished = true;
+    pushCampProg(campId);
+    setTimeout(() => {
+      if (_campEngines.get(campId) === eng) _campEngines.delete(campId);
+    }, 120000); 
+  }
+}
+
+// ── New campaign engine API routes ────────────────────────────
+
+app.post('/api/campaigns/:id/exec', (req, res) => {
+  const campId = req.params.id;
+  const existing = _campEngines.get(campId);
+  
+  if (existing && !existing.isFinished && existing.status !== 'stopped') {
+    return res.status(409).json({ error: 'Campaign is already running or pausing.' });
+  }
+
+  const { type, sIds, subjectTemplate, skipEmails, signatures } = req.body;
+  if (!sIds?.length) return res.status(400).json({ error: 'sIds required' });
+
+  // FIXED: SYNCHRONOUS ENGINE LOCK to prevent double-starting
+  const eng = {
+    abort: false, pause: false, type: type || 'first', status: 'initializing',
+    sent: 0, total: 0, errors: [], logMap: new Map(), histBatch: [], isFinished: false,
+  };
+  _campEngines.set(campId, eng);
+
+  res.json({ ok: true });
+
+  setImmediate(() => {
+    launchCampaign(campId, {
+      type:            type || 'first',
+      sIds,
+      subjectTemplate: subjectTemplate || '',
+      skipEmails:      skipEmails || [],
+      signatures:      signatures || {}
+    }, eng).catch(e => {
+      console.error('[Campaign Engine]', e.message);
+      eng.status = 'error';
+      eng.isFinished = true;
+      ssePush('camp_progress', { campId, status: 'error', error: e.message });
+      _campEngines.delete(campId);
+    });
+  });
+});
+
+app.post('/api/campaigns/:id/pause', (req, res) => {
+  const e = _campEngines.get(req.params.id);
+  if (!e) return res.status(404).json({ error: 'No active engine' });
+  e.pause = !e.pause;
+  e.status = e.pause ? 'paused' : 'running';
+  pushCampProg(req.params.id);
+  res.json({ ok: true, paused: e.pause });
+});
+
+app.post('/api/campaigns/:id/stop', (req, res) => {
+  const e = _campEngines.get(req.params.id);
+  if (e) {
+    e.abort = true;
+    e.pause = false;
+    e.status = 'stopped';
+    try {
+      const camp = stmts.getCampaign.get(req.params.id);
+      if (camp) {
+        safeJson(camp.sender_ids, []).forEach(sid => evictTransporter(sid));
+      }
+    } catch (_) {}
+    pushCampProg(req.params.id);
+  }
+  res.json({ ok: true });
+});
+
+app.get('/api/campaigns/:id/engine', (req, res) => {
+  const e = _campEngines.get(req.params.id);
+  if (!e) return res.json({ status: 'idle' });
+  res.json({
+    type: e.type, status: e.status, sent: e.sent, total: e.total,
+    errors: e.errors.slice(0, 20),
+    logEntries: [...e.logMap.values()].filter(l => l.status === 'sending' || l.status === 'error'),
+  });
+});
 
 app.listen(PORT, () => {
   console.log(`MailOS running on http://localhost:${PORT}`);

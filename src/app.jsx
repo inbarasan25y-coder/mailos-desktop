@@ -200,32 +200,37 @@ const ls = {
 // ── Serialized localStorage append — prevents race conditions in parallel sends
 const _lsWriteQueues = {};
 function lsAppendSafe(key, item) {
+  // Fire-and-forget: schedule via microtask so it never blocks the send counter
   if (!_lsWriteQueues[key]) _lsWriteQueues[key] = Promise.resolve();
-  _lsWriteQueues[key] = _lsWriteQueues[key].then(() => {
-    try {
-      const arr = ls.get(key,[]);
-      const dupKey = item.trackId
-        ? 'tid:' + item.trackId
-        : `${item.rowIdx}::${item.touchType || 'first'}`;
-      const isDup  = arr.some(a =>
-        (a.trackId ? 'tid:' + a.trackId : `${a.rowIdx}::${a.touchType || 'first'}`) === dupKey
-      );
-      if (isDup) return;
-      arr.push(item);
-      const capped = arr.length > 5000 ? arr.slice(arr.length - 5000) : arr;
-      ls.set(key, capped);
-    } catch (e) {
-      try {
-        const arr = ls.get(key,[]).map(x => ({ ...x, bodyHTML: (x.bodyHTML || '').slice(0, 300) }));
-        const dupKey = item.trackId || `${item.toEmail}::${item.rowIdx}::${item.touchType || 'first'}`;
-        if (!arr.some(a => (a.trackId || `${a.toEmail}::${a.rowIdx}::${a.touchType || 'first'}`) === dupKey)) {
-          arr.push({ ...item, bodyHTML: (item.bodyHTML || '').slice(0, 300) });
-          const capped = arr.length > 5000 ? arr.slice(arr.length - 5000) : arr;
-          ls.set(key, capped);
+  _lsWriteQueues[key] = _lsWriteQueues[key].then(() =>
+    new Promise(resolve => {
+      // Yield to UI thread first via setTimeout(0)
+      setTimeout(() => {
+        try {
+          const arr = ls.get(key, []);
+          const dupKey = item.trackId
+            ? 'tid:' + item.trackId
+            : `${item.rowIdx}::${item.touchType || 'first'}`;
+          const isDup = arr.some(a =>
+            (a.trackId ? 'tid:' + a.trackId : `${a.rowIdx}::${a.touchType || 'first'}`) === dupKey
+          );
+          if (!isDup) {
+            arr.push(item);
+            const capped = arr.length > 5000 ? arr.slice(-5000) : arr;
+            ls.set(key, capped);
+          }
+        } catch {
+          try {
+            // Fallback: strip bodyHTML to save space
+            const arr = ls.get(key, []).map(x => ({ ...x, bodyHTML: '' }));
+            arr.push({ ...item, bodyHTML: '' });
+            ls.set(key, arr.length > 5000 ? arr.slice(-5000) : arr);
+          } catch {}
         }
-      } catch (e2) { console.warn('lsAppendSafe: storage exhausted', key); }
-    }
-  });
+        resolve();
+      }, 0);
+    })
+  );
   return _lsWriteQueues[key];
 }
 
@@ -295,11 +300,6 @@ const resolve = (template, map) => {
   });
 };
 
-// Replaces {{Account Signature}} with actual signature HTML.
-// If the user applied formatting to the placeholder (font, size, bold, etc.)
-// those styles are pushed into every element inside the signature HTML.
-// ── injectSignature v2: properly cascades ALL formatting from placeholder wrapper
-// into every node of the signature HTML, including overriding existing font-sizes.
 const injectSignature = (html, sigHtml) => {
   if (!html) return '';
   if (!html.match(/\{\{\s*Account\s*Signature\s*\}\}/i)) return html;
@@ -307,92 +307,99 @@ const injectSignature = (html, sigHtml) => {
   const fallback = sigHtml || '';
   if (!fallback) return html.replace(/\{\{\s*Account\s*Signature\s*\}\}/gi, '');
 
+  // Only examine INLINE elements when climbing the DOM tree.
+  // Block elements (div/p/td) reflect pitch layout, not intentional overrides.
+  const INLINE = new Set(['span','b','strong','i','em','u','s','strike','font','sub','sup','mark','small','big','tt','code']);
+
   try {
     const doc = document.createElement('div');
     doc.innerHTML = html;
 
-    // Find all text nodes containing the placeholder
     const walker = document.createTreeWalker(doc, NodeFilter.SHOW_TEXT, null, false);
     let node;
-    const targets =[];
+    const targets = [];
     while ((node = walker.nextNode())) {
-      if (/\{\{\s*Account\s*Signature\s*\}\}/i.test(node.nodeValue)) {
-        targets.push(node);
-      }
+      if (/\{\{\s*Account\s*Signature\s*\}\}/i.test(node.nodeValue)) targets.push(node);
     }
 
     targets.forEach(textNode => {
       const ov = {};
       let cur = textNode.parentElement;
-      let hasBold = false, hasItalic = false, hasUnder = false;
 
-      // Climb up the DOM tree to collect all inherited styles
+      // Climb DOM — innermost wins (we DON'T overwrite if already set)
       while (cur && cur !== doc) {
-        if (cur.style.fontSize && !ov['font-size']) ov['font-size'] = cur.style.fontSize;
-        if (cur.style.fontFamily && !ov['font-family']) ov['font-family'] = cur.style.fontFamily;
-        if (cur.style.color && !ov['color']) ov['color'] = cur.style.color;
-        if (cur.style.backgroundColor && !ov['background-color']) ov['background-color'] = cur.style.backgroundColor;
-        if (cur.style.fontWeight && !ov['font-weight']) ov['font-weight'] = cur.style.fontWeight;
-        if (cur.style.fontStyle && !ov['font-style']) ov['font-style'] = cur.style.fontStyle;
-        if (cur.style.textDecoration && !ov['text-decoration']) ov['text-decoration'] = cur.style.textDecoration;
+        const tag = (cur.tagName || '').toLowerCase();
+        if (INLINE.has(tag)) {
+          const s = cur.style;
+          // Explicit inline styles
+          if (s.fontSize        && !ov['font-size'])        ov['font-size']        = s.fontSize;
+          if (s.fontFamily      && !ov['font-family'])      ov['font-family']      = s.fontFamily.replace(/['"]/g, '').trim();
+          if (s.color           && !ov['color'])            ov['color']            = s.color;
+          if (s.backgroundColor && !ov['background-color']) ov['background-color'] = s.backgroundColor;
+          if (s.fontWeight      && !ov['font-weight'])      ov['font-weight']      = s.fontWeight;
+          if (s.fontStyle       && !ov['font-style'])       ov['font-style']       = s.fontStyle;
+          if (s.textDecoration  && !ov['text-decoration'])  ov['text-decoration']  = s.textDecoration;
 
-        const tag = cur.tagName.toLowerCase();
-        if (tag === 'b' || tag === 'strong') hasBold = true;
-        if (tag === 'i' || tag === 'em') hasItalic = true;
-        if (tag === 'u') hasUnder = true;
+          // Semantic tags (only if not already captured via inline style)
+          if ((tag === 'b' || tag === 'strong') && !ov['font-weight'])     ov['font-weight']     = 'bold';
+          if ((tag === 'i' || tag === 'em')     && !ov['font-style'])      ov['font-style']      = 'italic';
+          if (tag === 'u'                        && !ov['text-decoration']) ov['text-decoration'] = 'underline';
 
+          // Legacy <font> attributes
+          if (tag === 'font') {
+            if (cur.hasAttribute('color') && !ov['color'])       ov['color']       = cur.getAttribute('color');
+            if (cur.hasAttribute('face')  && !ov['font-family']) ov['font-family'] = cur.getAttribute('face').replace(/['"]/g,'').trim();
+            if (cur.hasAttribute('size')  && !ov['font-size']) {
+              const sizes = ['10px','13px','16px','18px','24px','32px','48px'];
+              ov['font-size'] = sizes[parseInt(cur.getAttribute('size')) - 1] || '14px';
+            }
+          }
+        }
         cur = cur.parentElement;
       }
 
-      if (hasBold && !ov['font-weight']) ov['font-weight'] = 'bold';
-      if (hasItalic && !ov['font-style']) ov['font-style'] = 'italic';
-      if (hasUnder && !ov['text-decoration']) ov['text-decoration'] = 'underline';
-
+      // Build the styled signature clone
       const sigDoc = document.createElement('span');
       sigDoc.innerHTML = fallback;
 
-      // Push all overrides to every element in the signature
       if (Object.keys(ov).length > 0) {
-        if (ov['font-size']) {
-          Array.from(sigDoc.querySelectorAll('[style]')).forEach(el => el.style.removeProperty('font-size'));
-          Array.from(sigDoc.querySelectorAll('font[size]')).forEach(f => f.removeAttribute('size'));
-        }
-        if (ov['font-family']) {
-          Array.from(sigDoc.querySelectorAll('[style]')).forEach(el => el.style.removeProperty('font-family'));
-          Array.from(sigDoc.querySelectorAll('font[face]')).forEach(f => f.removeAttribute('face'));
-        }
+        // Remove conflicting existing values from the signature elements
+        if (ov['font-size'])    { sigDoc.querySelectorAll('[style]').forEach(el => el.style.removeProperty('font-size'));    sigDoc.querySelectorAll('font[size]').forEach(f => f.removeAttribute('size')); }
+        if (ov['font-family'])  { sigDoc.querySelectorAll('[style]').forEach(el => el.style.removeProperty('font-family'));  sigDoc.querySelectorAll('font[face]').forEach(f => f.removeAttribute('face')); }
+        if (ov['color'])        { sigDoc.querySelectorAll('[style]').forEach(el => el.style.removeProperty('color'));        sigDoc.querySelectorAll('font[color]').forEach(f => f.removeAttribute('color')); }
+        if (ov['font-weight'])  sigDoc.querySelectorAll('[style]').forEach(el => el.style.removeProperty('font-weight'));
+        if (ov['font-style'])   sigDoc.querySelectorAll('[style]').forEach(el => el.style.removeProperty('font-style'));
+        if (ov['text-decoration']) sigDoc.querySelectorAll('[style]').forEach(el => el.style.removeProperty('text-decoration'));
 
-        Array.from(sigDoc.querySelectorAll('*')).forEach(el => {
+        // Apply overrides to every element
+        [sigDoc, ...Array.from(sigDoc.querySelectorAll('*'))].forEach(el => {
+          if (el.nodeType !== 1) return;
           Object.entries(ov).forEach(([p, v]) => el.style.setProperty(p, v, 'important'));
         });
 
+        // Wrap bare top-level text nodes so they also get styled
         Array.from(sigDoc.childNodes).forEach(n => {
           if (n.nodeType === 3 && n.textContent.trim()) {
-            const wrapper = document.createElement('span');
-            Object.entries(ov).forEach(([p, v]) => wrapper.style.setProperty(p, v, 'important'));
-            n.parentNode.insertBefore(wrapper, n);
-            wrapper.appendChild(n);
+            const w = document.createElement('span');
+            Object.entries(ov).forEach(([p, v]) => w.style.setProperty(p, v, 'important'));
+            n.parentNode.insertBefore(w, n);
+            w.appendChild(n);
           }
         });
       }
 
-      // Safe split & replace to preserve surrounding text like "Thanks,\n"
+      // Replace placeholder text node with the styled signature fragment
       const parts = textNode.nodeValue.split(/\{\{\s*Account\s*Signature\s*\}\}/i);
       const frag = document.createDocumentFragment();
       parts.forEach((part, i) => {
         if (part) frag.appendChild(document.createTextNode(part));
-        if (i < parts.length - 1) {
-          const sigClone = sigDoc.cloneNode(true);
-          Object.entries(ov).forEach(([p, v]) => sigClone.style.setProperty(p, v, 'important'));
-          frag.appendChild(sigClone);
-        }
+        if (i < parts.length - 1) frag.appendChild(sigDoc.cloneNode(true));
       });
-
       textNode.parentNode.replaceChild(frag, textNode);
     });
 
     return doc.innerHTML;
-  } catch (err) {
+  } catch {
     return html.replace(/\{\{\s*Account\s*Signature\s*\}\}/gi, fallback);
   }
 };
@@ -547,23 +554,40 @@ function normalizeForOutlook(html){
   try{
     const d=document.createElement('div');
     d.innerHTML=html;
-    
-    // Wipe out `<font>` tags completely, translating to spans
-    d.querySelectorAll('font').forEach(f => {
-        const span = document.createElement('span');
-        if (f.hasAttribute('color')) span.style.color = f.getAttribute('color');
-        if (f.hasAttribute('face')) span.style.fontFamily = f.getAttribute('face').replace(/['"]/g, '');
-        if (f.hasAttribute('size')) {
-            const sizes =['10px','13px','16px','18px','24px','32px','48px'];
-            span.style.fontSize = sizes[parseInt(f.getAttribute('size'))-1] || '14px';
-        }
-        if (f.style.cssText) span.style.cssText += f.style.cssText;
-        while(f.firstChild) span.appendChild(f.firstChild);
-        f.parentNode.replaceChild(span, f);
+
+    // ── 1. Convert <font> tags to inline-styled spans (Outlook ignores <font>)
+    Array.from(d.querySelectorAll('font')).forEach(f => {
+      const span = document.createElement('span');
+      let style = f.style.cssText || '';
+      if (f.hasAttribute('color') && !/(?<![a-z-])color/i.test(style))
+        style = `color:${f.getAttribute('color')};${style}`;
+      if (f.hasAttribute('face') && !/font-family/i.test(style))
+        style = `font-family:${f.getAttribute('face').replace(/['"]/g,'').trim()};${style}`;
+      if (f.hasAttribute('size') && !/font-size/i.test(style)){
+        const sizes=['10px','13px','16px','18px','24px','32px','48px'];
+        style = `font-size:${sizes[parseInt(f.getAttribute('size'))-1]||'14px'};${style}`;
+      }
+      if (style) span.setAttribute('style', style);
+      while(f.firstChild) span.appendChild(f.firstChild);
+      f.parentNode.replaceChild(span, f);
     });
 
-    // Fix <p> tags to <div> so Outlook doesn't inject massive padding
-    d.querySelectorAll('p').forEach(p=>{
+    // ── 2. Outlook underline fix: text-decoration → <u> tags
+    // Outlook's Word renderer strips text-decoration from inline styles entirely.
+    Array.from(d.querySelectorAll('[style]')).forEach(el => {
+      const td = (el.style.textDecoration || el.style.textDecorationLine || '').toLowerCase();
+      if (td.includes('underline')) {
+        el.style.removeProperty('text-decoration');
+        el.style.removeProperty('text-decoration-line');
+        if (!el.style.cssText.trim()) el.removeAttribute('style');
+        const u = document.createElement('u');
+        el.parentNode.insertBefore(u, el);
+        u.appendChild(el);
+      }
+    });
+
+    // ── 3. <p> → <div> (Outlook injects huge margins on <p> tags)
+    Array.from(d.querySelectorAll('p')).forEach(p=>{
       const div=document.createElement('div');
       Array.from(p.attributes).forEach(a=>div.setAttribute(a.name,a.value));
       div.style.margin='0';
@@ -572,32 +596,51 @@ function normalizeForOutlook(html){
       div.innerHTML=p.innerHTML||'<br>';
       p.parentNode.replaceChild(div,p);
     });
-    // Zero margin/padding only on divs that have NO margin/padding set at all
-    d.querySelectorAll('div').forEach(div=>{
-      const hasMgn=div.style.margin||div.style.marginTop||div.style.marginBottom||div.style.marginLeft||div.style.marginRight;
+
+    // ── 4. Zero margin/padding on divs that have none set
+    Array.from(d.querySelectorAll('div')).forEach(div=>{
+      const hasMgn=div.style.margin||div.style.marginTop||div.style.marginBottom;
       const hasPad=div.style.padding||div.style.paddingTop||div.style.paddingBottom;
-      if(!hasMgn)div.style.margin='0';
-      if(!hasPad)div.style.padding='0';
+      if(!hasMgn) div.style.margin='0';
+      if(!hasPad) div.style.padding='0';
     });
 
-    // ── FIXED: Bulletproof cross-client bullet & numbered lists
-    // Outlook desktop requires margin-left, web browsers prefer padding-left. 
-    // Setting margin-left to 30px and zeroing padding normalizes it perfectly across both.
-    d.querySelectorAll('ul').forEach(ul=>{
+    // ── 5. Bulletproof cross-client lists
+    Array.from(d.querySelectorAll('ul')).forEach(ul=>{
       ul.setAttribute('type','disc');
-      ul.style.cssText='margin:0 0 10px 30px; padding:0; list-style-type:disc; list-style-position:outside;';
-      ul.querySelectorAll('li').forEach(li=>{
-        li.style.cssText='margin:0 0 4px 0; padding:0; display:list-item; text-align:left;';
+      ul.style.cssText='margin:0 0 10px 30px;padding:0;list-style-type:disc;list-style-position:outside;';
+      Array.from(ul.querySelectorAll('li')).forEach(li=>{
+        li.style.cssText='margin:0 0 4px 0;padding:0;display:list-item;text-align:left;';
       });
     });
-    
-    d.querySelectorAll('ol').forEach(ol=>{
+    Array.from(d.querySelectorAll('ol')).forEach(ol=>{
       ol.setAttribute('type','1');
-      ol.style.cssText='margin:0 0 10px 30px; padding:0; list-style-type:decimal; list-style-position:outside;';
-      ol.querySelectorAll('li').forEach(li=>{
-        li.style.cssText='margin:0 0 4px 0; padding:0; display:list-item; text-align:left;';
+      ol.style.cssText='margin:0 0 10px 30px;padding:0;list-style-type:decimal;list-style-position:outside;';
+      Array.from(ol.querySelectorAll('li')).forEach(li=>{
+        li.style.cssText='margin:0 0 4px 0;padding:0;display:list-item;text-align:left;';
       });
     });
+
+    // ── 6. Stamp font-family/size/color onto EVERY element that's missing them
+    // Outlook doesn't inherit CSS — each element needs explicit properties.
+    const allEls = Array.from(d.querySelectorAll('*'));
+    // Find the dominant font properties from the root/body level
+    let domFont='', domSize='', domColor='';
+    allEls.forEach(el => {
+      if (!domFont && el.style.fontFamily) domFont = el.style.fontFamily.replace(/['"]/g,'').trim();
+      if (!domSize && el.style.fontSize)   domSize = el.style.fontSize;
+      if (!domColor && el.style.color)     domColor = el.style.color;
+    });
+
+    const VOIDS = new Set(['br','hr','img','input','meta','link','area','base','col','embed','param','source','track','wbr']);
+    if (domFont || domSize || domColor) {
+      allEls.forEach(el => {
+        if (VOIDS.has((el.tagName||'').toLowerCase())) return;
+        if (!el.style.fontFamily && domFont) el.style.fontFamily = domFont;
+        if (!el.style.fontSize   && domSize) el.style.fontSize   = domSize;
+        if (!el.style.color      && domColor) el.style.color     = domColor;
+      });
+    }
 
     return d.innerHTML;
   }catch{return html;}
@@ -1604,8 +1647,26 @@ function ComposeModal({accounts,defaultAccountId,replyTo,onClose,onSent}){
     if(!from)return setErr('Select a sender.');
     if(!to.trim())return setErr('To is required.');
     if(!subj.trim())return setErr('Subject is required.');
-    const html=editorRef.current?.innerHTML||'';
+    let html=editorRef.current?.innerHTML||'';
     if(!(editorRef.current?.textContent||'').trim())return setErr('Body is empty.');
+    // OUTLOOK UNDERLINE FIX: convert CSS text-decoration:underline → <u> tags
+    // Outlook's Word renderer ignores text-decoration in CSS; only <u> tags survive.
+    try{
+      const tmp=document.createElement('div');
+      tmp.innerHTML=html;
+      tmp.querySelectorAll('[style]').forEach(el=>{
+        const td=(el.style.textDecoration||el.style.textDecorationLine||'').toLowerCase();
+        if(td.includes('underline')){
+          el.style.removeProperty('text-decoration');
+          el.style.removeProperty('text-decoration-line');
+          if(!el.style.cssText.trim())el.removeAttribute('style');
+          const u=document.createElement('u');
+          el.parentNode.insertBefore(u,el);
+          u.appendChild(el);
+        }
+      });
+      html=tmp.innerHTML;
+    }catch{}
     setBusy(true);setErr('');
     try{await apiFetch('/accounts/'+from+'/send',{method:'POST',timeout:120000,body:JSON.stringify({to,cc:cc||undefined,bcc:bcc||undefined,subject:subj,body:html})});onSent?.();onClose();}
     catch(e){setErr(e.message);}
@@ -1846,30 +1907,194 @@ const VirtualMailList=memo(({mails,selectedMailId,accounts,onSelect,onRightClick
 // ═══════════════════════════════════════════════════════════════════
 // LIVE LOG VIEWER
 // ═══════════════════════════════════════════════════════════════════
-const LiveLogViewer=({campId,engRef})=>{
-  const [,tick]=useState(0);
-  useEffect(()=>{const iv=setInterval(()=>tick(n=>n+1),800);return()=>clearInterval(iv);},[]);
-  const logs=engRef.current[campId]?.logs||[];
-  const sc=s=>s==='error'?T.red:s==='sent'?T.grn:s==='sending'?T.acc:T.t2;
-  return(
-    <div style={{flex:1,overflowY:'auto',background:T.sur,borderRadius:12,padding:8,border:`1px solid ${T.b1}`}}>
-      <div style={{display:'grid',gridTemplateColumns:'44px 1fr 1fr 120px',gap:8,padding:'8px 12px',fontSize:10,color:T.t3,fontWeight:700,textTransform:'uppercase',letterSpacing:'.05em',borderBottom:`1px solid ${T.b1}`,position:'sticky',top:0,background:T.sur,zIndex:2}}>
-        <span>Row</span><span>Sender</span><span>Recipient</span><span>Status</span>
+const LiveLogViewer = ({ campId, engRef }) => {
+  const [now, setNow] = useState(() => Date.now());
+
+  // Tick every 500ms to update countdown timers
+  useEffect(() => {
+    const iv = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(iv);
+  }, []);
+
+  const eng = engRef.current[campId] || {};
+  const logMap = eng.logMap || new Map();
+  const allLogs = [...logMap.values()].sort((a, b) => {
+    // Sending first, then waiting (by soonest wakeTime), then errors
+    const order = { sending: 0, waiting: 1, error: 2 };
+    const oa = order[a.status] ?? 1, ob = order[b.status] ?? 1;
+    if (oa !== ob) return oa - ob;
+    return (a.wakeTime || 0) - (b.wakeTime || 0);
+  });
+
+  const fmtCountdown = (wakeTime) => {
+    if (!wakeTime) return '—';
+    const rem = Math.max(0, wakeTime - now);
+    if (rem === 0) return 'Now';
+    const s = Math.floor(rem / 1000);
+    const m = Math.floor(s / 60);
+    return m > 0 ? `${m}m ${s % 60}s` : `${s}s`;
+  };
+
+  const fmtProgress = (wakeTime) => {
+    if (!wakeTime) return 0;
+    // We don't know start time, but we can show "time left" as a rough bar
+    // Cap at 600s (10 min max delay) for bar width calculation
+    const rem = Math.max(0, wakeTime - now);
+    const pct = Math.max(0, Math.min(100, 100 - (rem / (600 * 1000)) * 100));
+    return pct;
+  };
+
+  const statusConfig = {
+    sending: { label: '⚡ SENDING',  bg: 'rgba(0,120,212,0.08)', border: 'rgba(0,120,212,0.25)', color: T.acc,  dot: T.acc,  pulse: true  },
+    waiting: { label: '⏱ WAITING',  bg: 'rgba(255,255,255,0)', border: T.b1,                    color: T.t2,  dot: T.t3,  pulse: false },
+    error:   { label: '✕ ERROR',    bg: 'rgba(255,69,96,0.06)', border: 'rgba(255,69,96,0.22)', color: T.red, dot: T.red, pulse: false },
+  };
+
+  return (
+    <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 6, minHeight: 0 }}>
+      {/* Header */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '48px 1fr 1fr 110px 130px',
+        gap: 8, padding: '8px 14px',
+        fontSize: 10, color: T.t3, fontWeight: 700,
+        textTransform: 'uppercase', letterSpacing: '.05em',
+        borderBottom: `1px solid ${T.b1}`,
+        background: T.sur, borderRadius: '10px 10px 0 0',
+        flexShrink: 0,
+      }}>
+        <span>Row</span>
+        <span>Sender</span>
+        <span>Recipient</span>
+        <span>Status</span>
+        <span>Sends In</span>
       </div>
-      {!logs.length?<div style={{padding:40,textAlign:'center',color:T.t3,fontSize:13}}>Initializing queue…</div>
-      :logs.map((log,i)=>{
-        const wait=log.wakeTime?Math.max(0,Math.ceil((log.wakeTime-Date.now())/1000)):0;
-        return(
-          <div key={i} style={{display:'grid',gridTemplateColumns:'44px 1fr 1fr 120px',gap:8,padding:'8px 12px',borderRadius:8,background:T.pan,border:`1px solid ${T.b1}`,fontSize:12,alignItems:'center',marginTop:4}}>
-            <span style={{color:T.t3,fontFamily:T.mn,fontSize:11}}>{log.row}</span>
-            <span style={{color:T.t1,fontWeight:600,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{log.fromEmail}</span>
-            <span style={{color:T.acc2,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{log.email}</span>
-            <span style={{fontWeight:700,fontFamily:T.mn,fontSize:11,color:sc(log.status)}}>
-              {log.status==='error'?'✕ ERR':log.status==='sent'?'✓ SENT':log.status==='sending'?'⚡ …':`⏱ ${String(Math.floor(wait/60)).padStart(2,'0')}:${String(wait%60).padStart(2,'0')}`}
-            </span>
+
+      {/* Body */}
+      <div style={{
+        flex: 1, overflowY: 'auto',
+        background: T.sur,
+        border: `1px solid ${T.b1}`,
+        borderRadius: '0 0 10px 10px',
+      }}>
+        {!allLogs.length ? (
+          <div style={{ padding: 48, textAlign: 'center', color: T.t3, fontSize: 13 }}>
+            <div style={{ fontSize: 32, marginBottom: 10, opacity: .3 }}>📭</div>
+            <p>No active emails queued yet…</p>
           </div>
-        );
-      })}
+        ) : allLogs.map((log, i) => {
+          const cfg = statusConfig[log.status] || statusConfig.waiting;
+          const isWaiting = log.status === 'waiting';
+          const isSending = log.status === 'sending';
+          const isError   = log.status === 'error';
+          const rem       = isWaiting && log.wakeTime ? Math.max(0, log.wakeTime - now) : 0;
+          const pct       = isWaiting ? fmtProgress(log.wakeTime) : isSending ? 100 : 0;
+
+          return (
+            <div key={log.key} style={{
+              display: 'grid',
+              gridTemplateColumns: '48px 1fr 1fr 110px 130px',
+              gap: 8, padding: '10px 14px',
+              borderBottom: i < allLogs.length - 1 ? `1px solid ${T.b1}` : 'none',
+              background: cfg.bg,
+              borderLeft: `3px solid ${cfg.border}`,
+              alignItems: 'center',
+              transition: 'background .2s',
+              position: 'relative',
+              overflow: 'hidden',
+            }}>
+              {/* Progress shimmer bar for waiting rows */}
+              {isWaiting && (
+                <div style={{
+                  position: 'absolute', bottom: 0, left: 0,
+                  height: 2,
+                  width: `${pct}%`,
+                  background: `linear-gradient(90deg, ${T.acc}44, ${T.acc}99)`,
+                  borderRadius: 1,
+                  transition: 'width .5s linear',
+                }} />
+              )}
+              {/* Row # */}
+              <span style={{ color: T.t3, fontFamily: T.mn, fontSize: 11 }}>
+                {log.row}
+              </span>
+              {/* Sender */}
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: T.t1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {log.fromEmail || '—'}
+                </div>
+              </div>
+              {/* Recipient */}
+              <div style={{ fontSize: 12, color: T.acc2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {log.email || '—'}
+              </div>
+              {/* Status badge */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                <div style={{
+                  width: 7, height: 7, borderRadius: '50%',
+                  background: cfg.dot, flexShrink: 0,
+                  animation: cfg.pulse ? 'pulse 1.2s ease-in-out infinite' : 'none',
+                }} />
+                <span style={{ fontSize: 10, fontWeight: 700, color: cfg.color, fontFamily: T.mn, letterSpacing: '.02em' }}>
+                  {isError ? (log.reason?.slice(0, 12) || 'ERROR') : cfg.label.split(' ')[1]}
+                </span>
+              </div>
+              {/* Countdown */}
+              <div style={{ textAlign: 'right' }}>
+                {isWaiting && (
+                  <span style={{
+                    fontSize: 12, fontWeight: 700,
+                    color: rem < 10000 ? T.grn : T.t1,
+                    fontFamily: T.mn,
+                    transition: 'color .3s',
+                  }}>
+                    {fmtCountdown(log.wakeTime)}
+                  </span>
+                )}
+                {isSending && (
+                  <span style={{ fontSize: 11, color: T.acc, fontFamily: T.mn, fontWeight: 600 }}>
+                    In flight…
+                  </span>
+                )}
+                {isError && (
+                  <span style={{ fontSize: 10, color: T.red, fontFamily: T.mn }}>
+                    {log.reason?.slice(0, 16) || 'Failed'}
+                  </span>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Summary footer */}
+      {allLogs.length > 0 && (
+        <div style={{
+          display: 'flex', gap: 14, alignItems: 'center',
+          padding: '8px 14px',
+          background: T.pan, border: `1px solid ${T.b1}`,
+          borderRadius: 10, flexShrink: 0, flexWrap: 'wrap',
+        }}>
+          {[
+            { s: 'sending', label: 'Sending',  color: T.acc },
+            { s: 'waiting', label: 'Queued',   color: T.t2  },
+            { s: 'error',   label: 'Errors',   color: T.red },
+          ].map(({ s, label, color }) => {
+            const cnt = allLogs.filter(l => l.status === s).length;
+            if (!cnt) return null;
+            return (
+              <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
+                <div style={{ width: 8, height: 8, borderRadius: '50%', background: color }} />
+                <span style={{ fontSize: 11, color, fontWeight: 700 }}>{cnt}</span>
+                <span style={{ fontSize: 11, color: T.t3 }}>{label}</span>
+              </div>
+            );
+          })}
+          <span style={{ fontSize: 11, color: T.t3, marginLeft: 'auto' }}>
+            Updates every 400ms via SSE
+          </span>
+        </div>
+      )}
     </div>
   );
 };
@@ -1900,24 +2125,31 @@ function CampaignsPage({accounts,signatures,accountSettings,campaigns,onUpdateCa
   const fuDraftRef=useRef({});
   const pitchSaveTimer=useRef(null);
   const fuSaveTimer=useRef(null);
-  const showToast=useCallback((msg,ms=2200)=>{setSaveToast(msg);setTimeout(()=>setSaveToast(''),ms);},[]);
+  const histBatchRef  = useRef({});
+  const histBatchTimer= useRef(null);
 
-  const sel=campaigns.find(c=>c.id===selId)||null;
-  useEffect(()=>{ls.set('mOS_selCamp',selId);},[selId]);
-
+  // ── 1. Declare fetchAndMergeHistory FIRST — used inside useEffect below ──
   const fetchAndMergeHistory = useCallback(async (id) => {
     if (!id) return;
     try {
-      const dbHist = await apiFetch('/campaigns/' + id + '/history', { timeout: 30000 });
+      let dbHist = [];
+      let offset = 0;
+      const PAGE = 5000;
+      while (true) {
+        const page = await apiFetch(`/campaigns/${id}/history?limit=${PAGE}&offset=${offset}`, { timeout: 60000 });
+        if (!Array.isArray(page) || !page.length) break;
+        dbHist = dbHist.concat(page);
+        if (page.length < PAGE) break;
+        offset += PAGE;
+      }
       if (!Array.isArray(dbHist)) return;
-
       setHistData(prev => {
-        const existing = prev[id] ||[];
+        const existing = prev[id] || [];
         const normalized = dbHist.map(h => ({
           rowIdx: h.rowIdx, sentAt: h.sentAt,
           senderEmail: h.senderEmail, senderName: h.senderName || '',
           toEmail: h.toEmail, subject: h.subject || '',
-          bodyHTML: h.bodyHTML || '', rowData: h.rowData ||[],
+          bodyHTML: h.bodyHTML || '', rowData: h.rowData || [],
           touchType: h.touchType || 'first', trackId: h.trackId || '',
         }));
         const merged = dedupeHistoryEntries([...existing, ...normalized]).sort(
@@ -1930,19 +2162,104 @@ function CampaignsPage({accounts,signatures,accountSettings,campaigns,onUpdateCa
     } catch (e) {
       console.warn("Failed to fetch history:", e);
     }
-  },[]);
+  }, []);
 
-  // Replace entire getHist:
-const getHist = useCallback((id) => {
-  const stateHist = histData[id] || [];   // has bodyHTML
-  let lsHist = [];
-  try { lsHist = ls.get('mOS_hist_' + id, []); } catch {}
-  // lsHist processed first (no bodyHTML), stateHist processed second →
-  // dedup's "prefer longer bodyHTML" rule lets stateHist win for equal sentAt
-  const merged = dedupeHistoryEntries([...lsHist, ...stateHist]);
-  merged.sort((a, b) => new Date(b.sentAt) - new Date(a.sentAt));
-  return merged;
-}, [histData]);
+  // ── 2. showToast ──────────────────────────────────────────────────────────
+  const showToast = useCallback((msg, ms=2200) => {
+    setSaveToast(msg); setTimeout(() => setSaveToast(''), ms);
+  }, []);
+
+  // ── 3. flushHistBatch ─────────────────────────────────────────────────────
+  const flushHistBatch = useCallback(async (campId) => {
+    const entries = histBatchRef.current[campId];
+    if (!entries?.length) return;
+    histBatchRef.current[campId] = [];
+    try {
+      await apiFetch('/campaigns/' + campId + '/history/batch', {
+        method: 'POST', timeout: 90000,
+        body: JSON.stringify({ entries }),
+      });
+    } catch {
+      for (const e of entries) {
+        apiFetch('/campaigns/' + campId + '/history', {
+          method: 'POST', timeout: 30000,
+          body: JSON.stringify(e),
+        }).catch(() => {});
+      }
+    }
+  }, []);
+
+  // ── 4. useEffect that consumes fetchAndMergeHistory (declared above) ──────
+  useEffect(() => {
+    const handler = ev => {
+      try {
+        const {
+          campId, type, status, sent, total,
+          errors, logEntries, newHistEntries,
+        } = ev.detail;
+
+        setProg(campId, {
+          type, status,
+          sent:   sent   ?? 0,
+          total:  total  ?? 0,
+          errors: errors || [],
+          ...(status === 'done' || status === 'stopped' ? { endTime: new Date() } : {}),
+        });
+
+        if (!engRef.current[campId]) {
+          engRef.current[campId] = {
+            abort: false, pause: false, logMap: new Map(),
+            blocked: new Set(), errors: [], sentRows: new Set(),
+            histBatch: [],
+          };
+        }
+        const logMap = engRef.current[campId].logMap;
+        logMap.clear();
+        (logEntries || []).forEach(l => logMap.set(l.key, l));
+        if (status === 'done' || status === 'stopped') {
+          engRef.current[campId].abort = true;
+        }
+
+        if (newHistEntries?.length) {
+          setHistData(prev => {
+            const existing = prev[campId] || [];
+            const merged = dedupeHistoryEntries([...existing, ...newHistEntries]);
+            merged.sort((a, b) => new Date(b.sentAt) - new Date(a.sentAt));
+            try {
+              ls.set('mOS_hist_' + campId,
+                merged.slice(0, 5000).map(h => ({ ...h, bodyHTML: '' }))
+              );
+            } catch {}
+            return { ...prev, [campId]: merged };
+          });
+          setHistVersion(v => v + 1);
+        }
+
+        if (status === 'done' || status === 'stopped') {
+          fetchAndMergeHistory(campId);
+        }
+      } catch {}
+    };
+
+    window.addEventListener('__mOS_camp', handler);
+    return () => window.removeEventListener('__mOS_camp', handler);
+  }, [fetchAndMergeHistory]);
+
+  const sel=campaigns.find(c=>c.id===selId)||null;
+  useEffect(()=>{ls.set('mOS_selCamp',selId);},[selId]);
+
+     const getHist = useCallback((id) => {
+    const stateHist = histData[id] || [];
+    // Always read fresh from LS — no stale ref cache that races with memos
+    let lsHist = [];
+    try { lsHist = ls.get('mOS_hist_' + id, []); } catch {}
+    const merged = dedupeHistoryEntries([...lsHist, ...stateHist]);
+    merged.sort((a, b) => new Date(b.sentAt) - new Date(a.sentAt));
+    return merged;
+  }, [histData]);
+
+
+
 
   useEffect(() => {
     if (!selId) return;
@@ -2031,25 +2348,28 @@ const getHist = useCallback((id) => {
   const pendingUpdates = useRef({});
   const saveDebounceTimer = useRef(null);
 
+  // Ref holds latest campaign snapshot — no stale closure, no O(n) scan inside debounce
+  const selCampRef = useRef(sel);
+  useEffect(() => { selCampRef.current = sel; }, [sel]);
+
   const upd = useCallback((obj) => {
     if (!selId) return;
     const currentId = selId;
     if (obj.csvHeaders !== undefined || obj.csvRows !== undefined) {
-      const current = campaigns.find(c => c.id === currentId);
-      const h  = obj.csvHeaders !== undefined ? obj.csvHeaders : current?.csvHeaders ||[];
-      const rw = obj.csvRows    !== undefined ? obj.csvRows    : current?.csvRows    ||[];
+      const current = selCampRef.current;
+      const h  = obj.csvHeaders !== undefined ? obj.csvHeaders : current?.csvHeaders || [];
+      const rw = obj.csvRows    !== undefined ? obj.csvRows    : current?.csvRows    || [];
       try { ls.set('mOS_csv_' + currentId, { headers: h, rows: rw }); } catch {}
     }
-    
+
     onUpdateCampaigns(prev => prev.map(c => c.id === currentId ? { ...c, ...obj } : c));
     pendingUpdates.current = { ...pendingUpdates.current, ...obj };
-    
+
     const processQueue = async () => {
       if (Object.keys(pendingUpdates.current).length === 0) return;
       const payload = { ...pendingUpdates.current };
       pendingUpdates.current = {};
-      
-      // Pull absolute latest text instantly right before network push
+
       if (Object.prototype.hasOwnProperty.call(payload, 'pitch')) {
         const live = pitchDraftRef.current[currentId] ?? (pitchRef.current ? pitchRef.current.innerHTML : undefined);
         if (live !== undefined && live !== null) payload.pitch = live;
@@ -2058,16 +2378,11 @@ const getHist = useCallback((id) => {
         const liveFu = fuDraftRef.current[currentId] ?? (fuRef.current ? fuRef.current.innerHTML : undefined);
         if (liveFu !== undefined && liveFu !== null) payload.fuPitch = liveFu;
       }
-      
+
       try {
-        await apiFetch('/campaigns/' + currentId, {
-          method: 'PUT',
-          body: JSON.stringify(payload),
-        });
+        await apiFetch('/campaigns/' + currentId, { method: 'PUT', body: JSON.stringify(payload) });
       } catch (err) {
-        // Automatically put the unsaved work back in the queue and try again later!
         pendingUpdates.current = { ...payload, ...pendingUpdates.current };
-        console.warn('Network error saving campaign, requeued:', err);
         clearTimeout(saveDebounceTimer.current);
         saveDebounceTimer.current = setTimeout(processQueue, 3000);
       }
@@ -2075,7 +2390,7 @@ const getHist = useCallback((id) => {
 
     clearTimeout(saveDebounceTimer.current);
     saveDebounceTimer.current = setTimeout(processQueue, 800);
-  },[selId, onUpdateCampaigns, campaigns]);
+  }, [selId, onUpdateCampaigns]); // ← removed `campaigns` dependency — uses ref now
 
   // 🔥 FIXED: Direct explicit saver now feeds into the secure queue rather than fighting it
   const savePitch=()=>{
@@ -2198,7 +2513,20 @@ const delCamp = id => {
     document.execCommand('insertHTML',false,'{{'+name+'}}');
   };
 
-  const initEng=id=>{engRef.current[id]={abort:false,pause:false,logs:[],blocked:new Set(),errors:[]};};
+  const initEng = id => {
+  engRef.current[id] = {
+    abort: false, pause: false,
+    logMap: new Map(),  // key=`${row}::${email}` → log entry
+    blocked: new Set(), errors: [], sentRows: new Set()
+  };
+  };
+
+  // ── Helper to update a single log entry safely:
+  const setLogEntry = (eng, row, email, patch) => {
+    const k = `${row}::${email}`;
+    const existing = eng.logMap.get(k) || { key: k, row, email, fromEmail: '', status: 'waiting' };
+    eng.logMap.set(k, { ...existing, ...patch });
+  };
   
   // 🔥 FIX 1: Atomic state updater prevents race conditions when parallel senders update the math
   const setProg = (id, obj) => setProgMap(prev => {
@@ -2207,223 +2535,150 @@ const delCamp = id => {
     return { ...prev, [id]: { ...cur, ...parsed } };
   });
 
-  const delayLoop=async(ms,id)=>{
-    const e=engRef.current[id];let end=Date.now()+ms;
-    while(Date.now()<end){
-      if(e.abort)return false;
-      while(e.pause&&!e.abort){await new Promise(r=>setTimeout(r,200));end+=200;}
-      if(e.abort)return false;
-      await new Promise(r=>setTimeout(r,Math.min(250,Math.max(10,end-Date.now()))));
+  const delayLoop = async (ms, id, logKey) => {
+    const e = engRef.current[id];
+    let end = Date.now() + ms;
+    
+    while (Date.now() < end) {
+      if (e.abort) return false;
+      
+      while (e.pause && !e.abort) {
+        await new Promise(r => setTimeout(r, 200));
+        end += 200; // Pushes the target end time forward exactly by the paused duration
+        if (logKey && e.logMap.has(logKey)) {
+          const log = e.logMap.get(logKey);
+          e.logMap.set(logKey, { ...log, wakeTime: end }); // Flawlessly freezes timer visually
+        }
+      }
+      
+      if (e.abort) return false;
+      
+      const remain = end - Date.now();
+      if (remain > 0) {
+        await new Promise(r => setTimeout(r, Math.min(250, remain)));
+      }
     }
     return true;
   };
 
-  const sendCamp=async()=>{
-    const id=selId;
-    const livePitch=pitchRef.current?.innerHTML||pitchDraftRef.current[id]||ls.get('mOS_draft_'+id,'')||sel.pitch||'';
-    const snap={...sel,pitch:livePitch};
-    if(!snap.pitch.replace(/<[^>]+>/g,'').trim())return alert('Pitch is empty.');
-    if(!snap.subject?.trim())return alert('Subject is required.');
-    const ec=snap.emailCol>=0?snap.emailCol:(snap.csvHeaders||[]).findIndex(h=>/email|mail/i.test(h||''));
-    if(ec<0)return alert('No email column found.');
-    const sIds=snap.senderIds||[];if(!sIds.length)return alert('Select at least one sender.');
-    const rows=snap.csvRows||[];
+  const sendCamp = async () => {
+    const id = selId;
 
-    // ── LAYER 1: row-index dedup from LS + DB
-    const doneSet=new Set((ls.get('mOS_sentRows_'+id,[])||[]).map(Number));
-    try{
-      const dbRows=await apiFetch('/campaigns/'+id+'/sent-rows',{timeout:10000});
-      if(dbRows?.length){dbRows.forEach(ri=>doneSet.add(Number(ri)));}
-    }catch{}
+    // Validate using live editor content
+    const livePitch = pitchRef.current?.innerHTML
+      || pitchDraftRef.current[id]
+      || ls.get('mOS_draft_' + id, '')
+      || sel.pitch || '';
 
-    // ── LAYER 2: email-address dedup from history (survives stop/reload/relaunch)
-    const sentEmailSet=new Set();
-    try{
-      const hist=await apiFetch('/campaigns/'+id+'/history',{timeout:20000});
-      if(Array.isArray(hist)){
-        hist.filter(h=>!h.touchType||h.touchType==='first').forEach(h=>{
-          if(h.toEmail)sentEmailSet.add(h.toEmail.toLowerCase().trim());
-          if(h.rowIdx!=null)doneSet.add(Number(h.rowIdx));
-        });
-      }
-    }catch{}
-    // Sync the now-complete doneSet back to LS so next load is instant
-    ls.set('mOS_sentRows_'+id,[...doneSet]);
+    if (!livePitch.replace(/<[^>]+>/g, '').trim()) return alert('Pitch is empty.');
+    if (!sel.subject?.trim()) return alert('Subject is required.');
+    if (sel.emailCol < 0 && !(sel.csvHeaders || []).some(h => /email|mail/i.test(h || '')))
+      return alert('No email column found.');
+    const sIds = sel.senderIds || [];
+    if (!sIds.length) return alert('Select at least one sender.');
 
-    // ── Build queue: skip if EITHER row index OR email address already done
-    const queue=rows
-      .map((r,i)=>({ri:i,email:((r||[])[ec]||'').trim().toLowerCase()}))
-      .filter(({ri,email})=>!doneSet.has(ri)&&!(email&&sentEmailSet.has(email)))
-      .map(({ri})=>({ri,failed:new Set()}));
+    // ── Step 1: Flush current pitch to DB so server can read it ──────────
+    // Only send pitch+subject (tiny). Server already has the CSV.
+    // This replaces the old approach of sending the full pitchTemplate in /exec.
+    try {
+      await apiFetch('/campaigns/' + id, {
+        method: 'PUT',
+        timeout: 20000,
+        body: JSON.stringify({
+          pitch:   livePitch,
+          subject: sel.subject,
+          // Note: csvHeaders/csvRows deliberately omitted — server already has them
+        }),
+      });
+    } catch (e) {
+      console.warn('[sendCamp] Pitch pre-save warning:', e.message);
+      // Non-fatal — server uses most recent DB version
+    }
 
-    if(!queue.length)return alert('Campaign complete — all recipients have already been emailed.');
+    initEng(id);
+    setTab('progress');
+    try { ls.set('mOS_tab_' + id, 'progress'); } catch {}
+    setProg(id, {
+      type: 'first', status: 'running',
+      sent: 0, total: (sel.csvRows || []).length,
+      errors: [], startTime: new Date(),
+    });
 
-    initEng(id);setTab('progress');
-    // sent counter starts from actual already-sent count, not 0
-    setProg(id,{type:'first',status:'running',sent:doneSet.size,total:rows.length,errors:[],startTime:new Date()});
-    const getNext=sid=>{for(let i=0;i<queue.length;i++){if(!queue[i].failed.has(sid))return queue.splice(i,1)[0];}return null;};
-
-    await Promise.all(sIds.map(async sid=>{
-      const e=engRef.current[id];
-      while(!e.abort&&!e.blocked.has(sid)){
-        while(e.pause&&!e.abort)await new Promise(r=>setTimeout(r,200));
-        if(e.abort||e.blocked.has(sid))return;
-        const item=getNext(sid);if(!item)break;
-        const{ri}=item;
-        const toEmail=((rows[ri]||[])[ec]||'').trim();if(!toEmail)continue;
-
-        // ── EMAIL-LEVEL guard: catches any rows that slipped through queue filter
-        if(sentEmailSet.has(toEmail.toLowerCase())){
-          doneSet.add(ri);
-          ls.set('mOS_sentRows_'+id,[...doneSet]);
-          apiFetch('/campaigns/'+id+'/sent-rows',{method:'POST',body:JSON.stringify({rowIdx:ri})}).catch(()=>{});
-          continue;
-        }
-
-        const acc=accounts.find(a=>a.id===sid)||{};
-        const cfg=accountSettings[sid]||{};
-        const ms=(cfg.minDelay??60)*1000+Math.random()*((cfg.maxDelay??180)-(cfg.minDelay??60))*1000;
-        e.logs=[{row:ri+1,email:toEmail,fromEmail:acc.email||sid,status:'waiting',wakeTime:Date.now()+ms},...e.logs].slice(0,1000);
-        if(!await delayLoop(ms,id))return;
-        const li=e.logs.findIndex(l=>l.row===ri+1);if(li!==-1)e.logs[li].status='sending';
-        setProg(id,{});
-        const m=rowMap(ri,snap);
-        const sigHtml=signatures[sid]?signatures[sid]:'';
-        let body=injectSignature(snap.pitch,sigHtml);
-        body=normalizeForOutlook(resolve(body,m).replace(/\{\{[^}]+\}\}/g,''));
-        const subj=resolve(snap.subject||'',m);
-        try{
-          const rowTrackId=`trk_${id}_${ri}_${Date.now().toString(36)}`;
-          await apiFetch('/accounts/'+sid+'/send',{method:'POST',timeout:300000,body:JSON.stringify({to:toEmail,subject:subj,body,trackId:rowTrackId})});
-          
-          const histEntry={rowIdx:ri,sentAt:new Date().toISOString(),senderEmail:acc.email||sid,senderName:acc.name||'',toEmail,subject:subj,
-            bodyHTML:body,rowData:rows[ri],touchType:'first',trackId:rowTrackId};
-
-          try{
-            await apiFetch('/campaigns/'+id+'/history',{
-              method:'POST',timeout:90000,
-              body:JSON.stringify({...histEntry,bodyHTML:body.slice(0,100000)})
-            });
-          }catch(histErr){
-            console.warn('History save failed, retrying in 8s:',histErr.message);
-            const _retryPayload=JSON.stringify({...histEntry,bodyHTML:body.slice(0,100000)});
-            setTimeout(()=>apiFetch('/campaigns/'+id+'/history',{method:'POST',timeout:60000,body:_retryPayload}).catch(()=>{}),8000);
-          }
-
-          setHistData(prev=>({...prev,[id]:[...(prev[id]||[]),histEntry]}));
-          await lsAppendSafe('mOS_hist_'+id,{
-            rowIdx:histEntry.rowIdx,sentAt:histEntry.sentAt,
-            senderEmail:histEntry.senderEmail,senderName:histEntry.senderName,
-            toEmail:histEntry.toEmail,subject:histEntry.subject,
-            rowData:histEntry.rowData,touchType:histEntry.touchType,
-            trackId:histEntry.trackId,bodyHTML:''
-          });
-          setHistVersion(v=>v+1);
-
-          // ── Mark done in ALL dedup stores immediately after confirmed send
-          sentEmailSet.add(toEmail.toLowerCase());
-          doneSet.add(ri);
-          ls.set('mOS_sentRows_'+id,[...doneSet]);
-          apiFetch('/campaigns/'+id+'/sent-rows',{method:'POST',body:JSON.stringify({rowIdx:ri})}).catch(()=>{});
-
-          const li2=e.logs.findIndex(l=>l.row===ri+1);if(li2!==-1)e.logs[li2].status='sent';
-          setProg(id,cur=>({sent:(cur.sent||0)+1}));
-        }catch(err){
-          const et=smtpErr(err.message);
-          e.errors=[{senderEmail:acc.email||sid,toEmail,reason:et},...e.errors].slice(0,50);
-          const li2=e.logs.findIndex(l=>l.row===ri+1);if(li2!==-1){e.logs[li2].status='error';e.logs[li2].reason=et;}
-          item.failed.add(sid);
-          if(BLOCK.has(et)){e.blocked.add(sid);if(item.failed.size<sIds.length)queue.push(item);setProg(id,{errors:e.errors});return;}
-          if(item.failed.size<sIds.length)queue.push(item);
-          setProg(id,{errors:e.errors});
-        }
-      }
-    }));
-    setProg(id,{status:engRef.current[id]?.abort?'stopped':'done',endTime:new Date()});
-    onUpdateCampaigns(prev=>prev.map(c=>c.id===snap.id?{...c,status:doneSet.size>=rows.length?'sent':c.status}:c));
+    // ── Step 2: Launch server-side engine ────────────────────────────────
+    // Request body is now ~100 bytes (just sIds + subjectTemplate).
+    // Server reads pitch + CSV directly from its own DB — no timeout risk.
+    try {
+      await apiFetch('/campaigns/' + id + '/exec', {
+        method:  'POST',
+        timeout: 60000, // was 15000 — gives server adequate time even under load
+        body: JSON.stringify({
+          type:            'first',
+          sIds,
+          subjectTemplate: sel.subject || '',
+          signatures:      Object.fromEntries(sIds.map(sid => [sid, signatures[sid] || ''])),
+        }),
+      });
+    } catch (e) {
+      setProg(id, { status: 'error', endTime: new Date() });
+      alert('Launch failed: ' + e.message);
+    }
   };
 
-  const sendFU=async()=>{
-    if(!sel)return;const id=sel.id;
-    const fuBody=fuRef.current?.innerHTML||fuDraftRef.current[id]||ls.get('mOS_draftFu_'+id,'')||sel.fuPitch||'';
-    if(!fuBody.replace(/<[^>]+>/g,'').trim())return alert('Write follow-up pitch first.');
-    const skipSet=new Set((sel.skipListText||'').match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g)?.map(x=>x.toLowerCase())||[]);
-    const hist=getHist(id);
-    const firsts=hist.filter(h=>(!h.touchType||h.touchType==='first')&&!skipSet.has((h.toEmail||'').toLowerCase()));
-    if(!firsts.length)return alert('No send history found!');
-    const fuDone=new Set(hist.filter(h=>h.touchType==='followup').map(h=>(h.toEmail||'').toLowerCase()));
-    const pending=firsts.filter(h=>!fuDone.has((h.toEmail||'').toLowerCase()));
-    if(!pending.length)return alert('All recipients already follow-upped!');
-    const bySender={};sel.senderIds.forEach(sid=>{bySender[sid]=[];});
-    pending.forEach(h=>{const acc=accounts.find(a=>a.email===h.senderEmail);if(acc&&sel.senderIds.includes(acc.id))bySender[acc.id].push(h);});
-    initEng(id);setTab('progress');
-    setProg(id,{type:'fu',status:'running',sent:0,total:pending.length,errors:[],startTime:new Date()});
+  const sendFU = async () => {
+    if (!sel) return;
+    const id = sel.id;
+    const fuBody = fuRef.current?.innerHTML || fuDraftRef.current[id] || ls.get('mOS_draftFu_' + id, '') || sel.fuPitch || '';
+    if (!fuBody.replace(/<[^>]+>/g, '').trim()) return alert('Write follow-up pitch first.');
 
-    await Promise.all(sel.senderIds.map(async sid=>{
-      const e=engRef.current[id];const q=bySender[sid]||[];
-      for(let i=0;i<q.length;i++){
-        if(e.abort||e.blocked.has(sid))return;
-        while(e.pause&&!e.abort)await new Promise(r=>setTimeout(r,200));
-        if(e.abort)return;
-        const h=q[i];const cfg=accountSettings[sid]||{};
-        const ms=(cfg.minDelay??60)*1000+Math.random()*((cfg.maxDelay??180)-(cfg.minDelay??60))*1000;
-        e.logs=[{row:h.rowIdx+1,email:h.toEmail,fromEmail:h.senderEmail,status:'waiting',wakeTime:Date.now()+ms},...e.logs].slice(0,1000);
-        if(!await delayLoop(ms,id))return;
-        const li=e.logs.findIndex(l=>l.row===h.rowIdx+1);if(li!==-1)e.logs[li].status='sending';
-        setProg(id,{});
-        const m=rowMapArr(h.rowData||[],sel.csvHeaders||[]);
-        const sigHtml=signatures[sid]?signatures[sid]:'';
-        let body=injectSignature(fuBody,sigHtml);
-        body=normalizeForOutlook(resolve(body,m).replace(/\{\{[^}]+\}\}/g,''));
-        const subj=(fuSubj||'').trim()?resolve(fuSubj,m)||fuSubj:'RE: '+(h.subject||'');
-        const sd=new Date(h.sentAt);
-        const fd=sd.toLocaleDateString('en-US',{weekday:'long',year:'numeric',month:'long',day:'numeric'})+' '+sd.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:true});
-        const thread=`<div>${body.trim()}</div><div style="margin:12px 0"><hr style="border:0;border-top:1px solid #e0e0e0"/></div><div style="font-size:12px;color:#444444;line-height:1.7"><b style="color:#111111">From:</b> ${h.senderName?`${h.senderName} &lt;${h.senderEmail}&gt;`:h.senderEmail}<br/><b style="color:#111111">Sent:</b> ${fd}<br/><b style="color:#111111">To:</b> ${h.toEmail}<br/><b style="color:#111111">Subject:</b> ${h.subject}</div><div style="margin-top:12px">${h.bodyHTML||''}</div>`;
-        try{
-          const fuRowTrackId = `trk_${id}_fu_${h.rowIdx}_${Date.now().toString(36)}`;
-          
-          // 1. Send Email
-          await apiFetch('/accounts/'+sid+'/send',{method:'POST',timeout:300000,body:JSON.stringify({to:h.toEmail,subject:subj,body:thread,trackId:fuRowTrackId})});
-          
-          const fuEntry={rowIdx:h.rowIdx,sentAt:new Date().toISOString(),senderEmail:h.senderEmail,senderName:h.senderName,toEmail:h.toEmail,subject:subj,
-            bodyHTML:thread,   
-            rowData:h.rowData||[],touchType:'followup',trackId:fuRowTrackId};
+    const skipSet = new Set((sel.skipListText || '').match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g)?.map(x => x.toLowerCase()) || []);
+    const hist = getHist(id);
+    const totalCount = hist.filter(h => (!h.touchType || h.touchType === 'first') && !skipSet.has((h.toEmail || '').toLowerCase())).length;
 
-          // 2. Await Database History Save BEFORE updating counter!
-          try {
-            await apiFetch('/campaigns/'+id+'/history',{
-              method:'POST', timeout:90000,
-              body:JSON.stringify({...fuEntry, bodyHTML:thread.slice(0,100000)})
-            });
-          } catch(fuHistErr) {
-            console.warn('FU history save failed, retrying:', fuHistErr.message);
-            const _retryFu = JSON.stringify({...fuEntry, bodyHTML:thread.slice(0,100000)});
-            setTimeout(()=> apiFetch('/campaigns/'+id+'/history',{method:'POST',timeout:60000,body:_retryFu}).catch(()=>{}), 8000);
-          }
+    // ── Step 1: Flush follow-up pitch to DB so server can read it directly ──
+    try {
+      await apiFetch('/campaigns/' + id, {
+        method: 'PUT',
+        timeout: 20000,
+        body: JSON.stringify({
+          fuPitch:   fuBody,
+          fuSubject: fuSubj || '',
+        }),
+      });
+    } catch (e) {
+      console.warn('[sendFU] Pre-save warning:', e.message);
+    }
 
-          // 3. Update memory/local storage safely
-          setHistData(prev => ({ ...prev, [id]: [...(prev[id] ||[]), fuEntry] }));
-          await lsAppendSafe('mOS_hist_' + id, { ...fuEntry, bodyHTML: '' }); 
-          setHistVersion(v=>v+1);
+    initEng(id);
+    setTab('progress');
+    setProg(id, { type: 'fu', status: 'running', sent: 0, total: totalCount, errors: [], startTime: new Date() });
 
-          const li2=e.logs.findIndex(l=>l.row===h.rowIdx+1);if(li2!==-1)e.logs[li2].status='sent';
-          
-          // 4. ATOMIC UI INCREMENT
-          setProg(id, cur => ({ sent: (cur.sent || 0) + 1 }));
-        }catch(err){
-          const et=smtpErr(err.message);
-          e.errors=[{senderEmail:h.senderEmail,toEmail:h.toEmail,reason:et},...e.errors].slice(0,50);
-          const li2=e.logs.findIndex(l=>l.row===h.rowIdx+1);if(li2!==-1){e.logs[li2].status='error';e.logs[li2].reason=et;}
-          if(BLOCK.has(et)){e.blocked.add(sid);setProg(id,{errors:e.errors});return;}
-          setProg(id,{errors:e.errors});
-        }
-      }
-    }));
-    setProg(id,{status:engRef.current[id]?.abort?'stopped':'done',endTime:new Date()});
+    // ── Step 2: Launch server-side follow-up engine ────────────────────────
+    try {
+      await apiFetch('/campaigns/' + id + '/exec', {
+        method: 'POST', timeout: 60000, // increased timeout to 60s
+        body: JSON.stringify({
+          type:            'fu',
+          sIds:            sel.senderIds || [],
+          subjectTemplate: fuSubj || '',
+          skipEmails:      [...skipSet],
+          signatures:      Object.fromEntries((sel.senderIds || []).map(sid => [sid, signatures[sid] || ''])),
+        }),
+      });
+    } catch (e) {
+      setProg(id, { status: 'error', endTime: new Date() });
+      alert('Launch failed: ' + e.message);
+    }
   };
 
-  const togglePause=()=>{const e=engRef.current[selId];if(e){e.pause=!e.pause;setProg(selId,{status:e.pause?'paused':'running'});}};
-  const stopEng=()=>{const e=engRef.current[selId];if(e){e.abort=true;e.pause=false;setProg(selId,{status:'stopped',endTime:new Date()});}};
+  const togglePause = () => {
+    apiFetch('/campaigns/' + selId + '/pause', { method: 'POST', timeout: 5000 })
+      .then(r => setProg(selId, { status: r.paused ? 'paused' : 'running' }))
+      .catch(() => {});
+  };
+  const stopEng = () => {
+    apiFetch('/campaigns/' + selId + '/stop', { method: 'POST', timeout: 5000 }).catch(() => {});
+    setProg(selId, { status: 'stopped', endTime: new Date() });
+  };
 
   const selH=sel?.csvHeaders||[], selR=sel?.csvRows||[], selS=sel?.senderIds||[], curP=progMap[selId];
 
@@ -2886,7 +3141,7 @@ const delCamp = id => {
                       <table style={{width:'100%',borderCollapse:'collapse',fontSize:12,textAlign:'left'}}>
                         <thead style={{position:'sticky',top:0,background:'#F9FAFC',zIndex:1,boxShadow:`0 1px 0 ${T.b1}`}}>
                           <tr>
-                            {['Stage','Sender','Recipient','Subject & Date','Tracking','Action'].map(h=>(
+                            {['Stage','Sender','Recipient','Subject & Date','Tracking', 'Delay', 'Action'].map(h=>(
                               <th key={h} style={{padding:'12px 16px',fontWeight:700,color:T.t2,fontSize:10,textTransform:'uppercase',letterSpacing:'.05em',whiteSpace:'nowrap'}}>{h}</th>
                             ))}
                           </tr>
@@ -2923,6 +3178,9 @@ const delCamp = id => {
                                     {!r.opened&&!r.clicked&&!r.replied&&!r.bounced&&!r.autoReply&&<span style={{color:T.t3,fontSize:11,fontWeight:500}}>Delivered</span>}
                                   </div>
                                 </td>
+                                <td style={{padding:'14px 16px', color:T.t2, fontSize:11, fontFamily:T.mn}}>
+                                  {r.trackId && r.trackId.includes('|D') ? r.trackId.split('|D')[1] + 's' : '0s'}
+                                </td>
                                 <td style={{padding:'14px 16px'}}>
                                   <button onClick={()=>setViewHistBody(r)} style={{background:T.sur,border:`1px solid ${T.b2}`,borderRadius:8,padding:'6px 12px',fontSize:11,fontWeight:600,color:T.acc2,cursor:'pointer',transition:'all .15s',boxShadow:'0 1px 2px rgba(0,0,0,0.03)'}} onMouseEnter={e=>{e.currentTarget.style.background=T.aBg;e.currentTarget.style.borderColor=T.acc;}} onMouseLeave={e=>{e.currentTarget.style.background=T.sur;e.currentTarget.style.borderColor=T.b2;}}>
                                     View Email
@@ -2944,7 +3202,7 @@ const delCamp = id => {
                     <div style={{display:'flex',gap:10,alignItems:'center'}}>
                       <input value={histSrch} onChange={e=>setHistSrch(e.target.value)} placeholder="Filter…" className="inp" style={{minWidth:200,padding:'7px 12px',fontSize:12}}/>
                       {hist.length>0&&<button onClick={()=>{
-                        const colHeaders=['#','Sender Name','Sender Email','To Email','Subject','Sent At','Stage','Opened','Clicked','Bounced','Auto-Reply','Replied',...selH];
+                        const colHeaders=['#','Sender Name','Sender Email','To Email','Subject','Sent At','Stage','Opened','Clicked','Bounced','Auto-Reply','Replied','Delay (s)',...selH];
                         const csvRows=[colHeaders,...hist.map((r,i)=>[
                           i+1,
                           r.senderName||'',
@@ -2958,6 +3216,7 @@ const delCamp = id => {
                           r.bounced?'Yes':'No',
                           r.autoReply?'Yes':'No',
                           r.replied?'Yes':'No',
+                          r.trackId && r.trackId.includes('|D') ? r.trackId.split('|D')[1] : '0',
                           ...(selH.map((_,ci)=>(r.rowData||[])[ci]||''))
                         ])];
                         const csv=csvRows.map(row=>row.map(v=>`"${String(v??'').replace(/"/g,'""')}"`).join(',')).join('\n');
@@ -3482,6 +3741,18 @@ export default function App(){
     const connect=()=>{
       try{
         es=new EventSource('http://localhost:5001/api/sse');
+        // Campaign engine progress — server pushes accurate state every 400ms
+              es.addEventListener('camp_progress', ev => {
+        // Forward to CampaignsPage via CustomEvent.
+        // setProg / engRef / fetchAndMergeHistory all live in CampaignsPage scope,
+        // not App — calling them here throws a silent ReferenceError.
+        try {
+          window.dispatchEvent(
+            new CustomEvent('__mOS_camp', { detail: JSON.parse(ev.data) })
+          );
+        } catch {}
+      });
+
         es.addEventListener('new_mail',ev=>{
           try{
             const{accountId,folder}=JSON.parse(ev.data);
@@ -3589,48 +3860,54 @@ const globalInboxMails = useMemo(() => {
   return all;
 }, [allMails]);
 
-  // Derived state
-const filteredMails = useMemo(() => {
-  if (!selFolder) return [];
-  let msgs = [];
-  const isGlobalInbox = selFolder === 'GLOBAL::inbox';
+// Memoize only the relevant folder slice — not the entire allMails object
+  const folderMails = useMemo(() => {
+    if (!selFolder || selFolder.startsWith('GLOBAL::')) return null;
+    return allMails[selFolder] || [];
+  }, [allMails, selFolder]);
 
-  if (selFolder.startsWith('GLOBAL::')) {
-    const t = selFolder.split('::')[1];
-    if (t === 'inbox') {
-      msgs = globalInboxMails; // pre-sorted date-desc, no further sort needed for default
-    } else if (t === 'reply') {
-      msgs = globalInboxMails.filter(m => m.type === 'reply' || (m.subject || '').toLowerCase().startsWith('re:'));
-    } else if (t === 'bounce') {
-      msgs = globalInboxMails.filter(m => m.type === 'bounce' || /(mailer-daemon|postmaster|undeliverable|delivery failed)/i.test((m.from?.email || '') + (m.subject || '')));
-    } else if (t === 'auto') {
-      msgs = globalInboxMails.filter(m => m.type === 'auto');
-    } else if (t === 'sent') {
-      msgs = [];
-      Object.keys(allMails).forEach(key => { const k = key.split('::')[1] || ''; if (/(sent|sent items|sent mail)/i.test(k)) msgs = msgs.concat(allMails[key]); });
+  const filteredMails = useMemo(() => {
+    if (!selFolder) return [];
+    let msgs = [];
+    const isGlobalInbox = selFolder === 'GLOBAL::inbox';
+
+    if (selFolder.startsWith('GLOBAL::')) {
+      const t = selFolder.split('::')[1];
+      if (t === 'inbox') {
+        msgs = globalInboxMails;
+      } else if (t === 'reply') {
+        msgs = globalInboxMails.filter(m => m.type === 'reply' || (m.subject || '').toLowerCase().startsWith('re:'));
+      } else if (t === 'bounce') {
+        msgs = globalInboxMails.filter(m => m.type === 'bounce' || /(mailer-daemon|postmaster|undeliverable|delivery failed)/i.test((m.from?.email || '') + (m.subject || '')));
+      } else if (t === 'auto') {
+        msgs = globalInboxMails.filter(m => m.type === 'auto');
+      } else if (t === 'sent') {
+        msgs = [];
+        Object.keys(allMails).forEach(key => { const k = key.split('::')[1] || ''; if (/(sent|sent items|sent mail)/i.test(k)) msgs = msgs.concat(allMails[key]); });
+      }
+    } else {
+      msgs = folderMails || []; // ← uses focused memo, not full allMails
     }
-  } else { msgs = allMails[selFolder] || []; }
 
-  if (debSrch) {
-    const q = debSrch.toLowerCase();
-    msgs = msgs.filter(m => (m.subject || '').toLowerCase().includes(q) || (m.from?.name || '').toLowerCase().includes(q) || (m.from?.email || '').toLowerCase().includes(q));
-  }
+    if (debSrch) {
+      const q = debSrch.toLowerCase();
+      msgs = msgs.filter(m => (m.subject || '').toLowerCase().includes(q) || (m.from?.name || '').toLowerCase().includes(q) || (m.from?.email || '').toLowerCase().includes(q));
+    }
 
-  // Skip sort + copy for the default case (global inbox date-desc already pre-sorted)
-  if (isGlobalInbox && sortBy === 'date-desc' && !debSrch) return msgs;
+    if (isGlobalInbox && sortBy === 'date-desc' && !debSrch) return msgs;
 
-  msgs = [...msgs];
-  switch (sortBy) {
-    case 'date-desc': msgs.sort((a, b) => (b._ts||new Date(b.date).getTime()) - (a._ts||new Date(a.date).getTime())); break;
-    case 'date-asc':  msgs.sort((a, b) => (a._ts||new Date(a.date).getTime()) - (b._ts||new Date(b.date).getTime())); break;
-    case 'name-asc':  msgs.sort((a, b) => (a.from?.name || a.from?.email || '').localeCompare(b.from?.name || b.from?.email || '')); break;
-    case 'name-desc': msgs.sort((a, b) => (b.from?.name || b.from?.email || '').localeCompare(a.from?.name || a.from?.email || '')); break;
-    case 'email-asc': msgs.sort((a, b) => (a.from?.email || '').localeCompare(b.from?.email || '')); break;
-    case 'email-desc':msgs.sort((a, b) => (b.from?.email || '').localeCompare(a.from?.email || '')); break;
-    default: break;
-  }
-  return msgs;
-}, [allMails, selFolder, debSrch, sortBy, globalInboxMails]);
+    msgs = [...msgs];
+    switch (sortBy) {
+      case 'date-desc': msgs.sort((a, b) => (b._ts || 0) - (a._ts || 0)); break;
+      case 'date-asc':  msgs.sort((a, b) => (a._ts || 0) - (b._ts || 0)); break;
+      case 'name-asc':  msgs.sort((a, b) => (a.from?.name || a.from?.email || '').localeCompare(b.from?.name || b.from?.email || '')); break;
+      case 'name-desc': msgs.sort((a, b) => (b.from?.name || b.from?.email || '').localeCompare(a.from?.name || a.from?.email || '')); break;
+      case 'email-asc': msgs.sort((a, b) => (a.from?.email || '').localeCompare(b.from?.email || '')); break;
+      case 'email-desc':msgs.sort((a, b) => (b.from?.email || '').localeCompare(a.from?.email || '')); break;
+      default: break;
+    }
+    return msgs;
+  }, [folderMails, selFolder, debSrch, sortBy, globalInboxMails, allMails]);
 
   const unreadMap=useMemo(()=>{
     const map={};Object.entries(allMails).forEach(([key,msgs])=>{const u=msgs.filter(m=>!m.read).length;if(u>0)map[key]=u;});return map;
